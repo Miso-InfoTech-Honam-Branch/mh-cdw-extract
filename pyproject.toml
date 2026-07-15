@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "new-extract"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.1.0",
+  "fastapi>=0.115.0",
+  "matplotlib>=3.8.0",
+  "openpyxl>=3.1.0",
+  "pydantic>=2.7.0,<3.0.0",
+  "python-multipart>=0.0.9",
+  "requests>=2.32.0",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[tool.setuptools]
+packages = ["cdw_extract"]
