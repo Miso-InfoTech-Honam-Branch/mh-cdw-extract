@@ -143,7 +143,10 @@ def refresh_connection_sync(connection_id: str, request: dict) -> dict:
         raise to_http_error(exc) from exc
 
 
-@app.post("/api/v1/connections/{connection_id}/tables/refresh")
+@app.post(
+    "/api/v1/connections/{connection_id}/tables/refresh",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def refresh_connection_alias(connection_id: str, background_tasks: BackgroundTasks, request: dict) -> dict:
     try:
         accepted = prepare_refresh_tables_job(connection_id, request, root_path())

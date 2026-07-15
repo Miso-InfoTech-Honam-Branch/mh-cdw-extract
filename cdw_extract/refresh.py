@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -13,6 +16,87 @@ from .manifest import save_connection_manifest, utc_now
 from .paths import connection_root, table_file_name
 
 TABLE_REFRESH = "TABLE_REFRESH"
+CALLBACK_MAX_ATTEMPTS = 3
+CALLBACK_INITIAL_BACKOFF_SECONDS = 0.1
+REDACTED = "[REDACTED]"
+
+logger = logging.getLogger(__name__)
+
+_SENSITIVE_KEY = (
+    r"(?:user(?:name)?|password|passwd|pwd|credentials?|token|access[_-]?token|"
+    r"refresh[_-]?token|api[_-]?key|secret|client[_-]?secret|authorization|cookie)"
+)
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b(?P<scheme>https?://)(?P<userinfo>[^/@\s]+)@")
+_QUOTED_SECRET_PATTERN = re.compile(
+    rf"(?i)(?P<prefix>[\"']?{_SENSITIVE_KEY}[\"']?\s*[:=]\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+)
+_UNQUOTED_SECRET_PATTERN = re.compile(
+    rf"(?i)(?P<prefix>\b{_SENSITIVE_KEY}\b\s*=\s*)(?P<value>[^&;\s,)\]}}\"']+)"
+)
+_HEADER_SECRET_PATTERN = re.compile(
+    rf"(?im)(?P<prefix>^\s*{_SENSITIVE_KEY}\s*:\s*)(?P<value>[^\r\n]+)$"
+)
+
+
+def sanitize_refresh_text(value: object) -> str:
+    """Remove credentials from errors before they cross the worker boundary."""
+    text = str(value or "")
+    text = _URL_USERINFO_PATTERN.sub(lambda match: f"{match.group('scheme')}{REDACTED}@", text)
+    text = _QUOTED_SECRET_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}{REDACTED}{match.group('quote')}",
+        text,
+    )
+    text = _UNQUOTED_SECRET_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{REDACTED}",
+        text,
+    )
+    return _HEADER_SECRET_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{REDACTED}",
+        text,
+    )
+
+
+def refresh_error_fields(exc: Exception) -> dict:
+    message = sanitize_refresh_text(exc)
+    return {
+        "errorCode": sanitize_refresh_text(type(exc).__name__),
+        "error": message,
+        "message": message,
+    }
+
+
+def callback_error_fields(exc: Exception) -> dict:
+    error = refresh_error_fields(exc)
+    return {
+        "errorCode": error["errorCode"],
+        "message": error["message"],
+        "attempts": CALLBACK_MAX_ATTEMPTS,
+        "occurredAt": utc_now(),
+    }
+
+
+def save_callback_error(data_root: str | Path, job: dict, exc: Exception) -> dict:
+    callback_error = callback_error_fields(exc)
+    job["callbackError"] = callback_error
+    logger.error(
+        "Table refresh callback delivery exhausted. jobId=%s state=%s errorCode=%s message=%s",
+        job.get("jobId"),
+        job.get("state"),
+        callback_error["errorCode"],
+        callback_error["message"],
+    )
+    return save_job(data_root, job)
+
+
+def success_job_fields(result: dict) -> dict:
+    return {
+        "state": "COMPLETED",
+        "connectionId": result["connectionId"],
+        "tableCount": result["tableCount"],
+        "rowCount": result["rowCount"],
+        "tables": result["tables"],
+        "message": result["message"],
+    }
 
 
 def callback_options(request: dict) -> dict:
@@ -32,11 +116,25 @@ def post_refresh_callback(request: dict, payload: dict) -> dict | None:
 
     headers = callback.get("headers") or {}
     timeout = float(callback.get("timeoutSeconds") or callback.get("timeout") or 10)
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    if response.status_code < 200 or response.status_code >= 300:
-        message = response.text[:4096].strip()
-        raise RuntimeError(f"refresh callback failed status={response.status_code} body={message}")
-    return {"url": url, "statusCode": response.status_code}
+    last_error: Exception | None = None
+    for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            if 200 <= response.status_code < 300:
+                return {"url": url, "statusCode": response.status_code, "attempts": attempt}
+            message = response.text[:4096].strip()
+            last_error = RuntimeError(
+                f"refresh callback failed status={response.status_code} body={message}"
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+
+        if attempt < CALLBACK_MAX_ATTEMPTS:
+            time.sleep(CALLBACK_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+    if last_error is None:
+        last_error = RuntimeError("refresh callback failed without a response")
+    raise last_error
 
 
 def refresh_success_callback_payload(result: dict) -> dict:
@@ -46,6 +144,7 @@ def refresh_success_callback_payload(result: dict) -> dict:
         "connectionId": result["connectionId"],
         "state": "SUCCESS",
         "status": "SUCCESS",
+        "message": result["message"],
         "tableCount": result["tableCount"],
         "rowCount": result["rowCount"],
         "tables": result["tables"],
@@ -59,9 +158,7 @@ def refresh_failure_callback_payload(job_id: str, connection_id: str, exc: Excep
         "connectionId": connection_id,
         "state": "FAILED",
         "status": "FAILED",
-        "errorCode": type(exc).__name__,
-        "error": str(exc),
-        "message": str(exc),
+        **refresh_error_fields(exc),
     }
 
 
@@ -142,6 +239,7 @@ def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path
         "jobType": TABLE_REFRESH,
         "connectionId": connection_id,
         "state": "COMPLETED",
+        "message": "Table Parquet refresh completed successfully.",
         "tableCount": len(artifacts),
         "rowCount": total_rows,
         "tables": artifacts,
@@ -149,7 +247,7 @@ def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path
 
 
 def refresh_tables(connection_id: str, request: dict, data_root: str | Path, job_id: str | None = None) -> dict:
-    job_id = job_id or str(uuid.uuid4())
+    job_id = job_id or request.get("jobId") or str(uuid.uuid4())
     job = save_job(
         data_root,
         {
@@ -163,23 +261,21 @@ def refresh_tables(connection_id: str, request: dict, data_root: str | Path, job
     try:
         result = refresh_tables_impl(connection_id, request, data_root, job_id)
     except Exception as exc:
-        job.update({"state": "FAILED", "error": str(exc)})
+        error_fields = refresh_error_fields(exc)
+        job.update({"state": "FAILED", **error_fields})
         save_job(data_root, job)
         try:
             post_refresh_callback(request, refresh_failure_callback_payload(job_id, connection_id, exc))
-        except Exception:
-            pass
-        raise
+        except Exception as callback_exc:
+            save_callback_error(data_root, job, callback_exc)
+        raise RuntimeError(error_fields["message"]) from None
 
-    job.update(
-        {
-            "state": "COMPLETED",
-            "tableCount": result["tableCount"],
-            "rowCount": result["rowCount"],
-        }
-    )
+    job.update(success_job_fields(result))
     save_job(data_root, job)
-    post_refresh_callback(request, refresh_success_callback_payload(result))
+    try:
+        post_refresh_callback(request, refresh_success_callback_payload(result))
+    except Exception as callback_exc:
+        save_callback_error(data_root, job, callback_exc)
     return result
 
 
@@ -190,7 +286,7 @@ def prepare_refresh_tables_job(connection_id: str, request: dict, data_root: str
     if not tables:
         raise ValueError("tables is required")
 
-    job_id = job_id or str(uuid.uuid4())
+    job_id = job_id or request.get("jobId") or str(uuid.uuid4())
     job = save_job(
         data_root,
         {
@@ -227,31 +323,17 @@ def run_refresh_tables_job(connection_id: str, request: dict, data_root: str | P
     try:
         result = refresh_tables_impl(connection_id, request, data_root, job_id)
     except Exception as exc:
-        job.update(
-            {
-                "state": "FAILED",
-                "errorCode": type(exc).__name__,
-                "error": str(exc),
-                "message": str(exc),
-            }
-        )
+        job.update({"state": "FAILED", **refresh_error_fields(exc)})
         save_job(data_root, job)
         try:
             post_refresh_callback(request, refresh_failure_callback_payload(job_id, connection_id, exc))
-        except Exception:
-            pass
+        except Exception as callback_exc:
+            save_callback_error(data_root, job, callback_exc)
         return
 
-    job.update(
-        {
-            "state": "COMPLETED",
-            "tableCount": result["tableCount"],
-            "rowCount": result["rowCount"],
-        }
-    )
+    job.update(success_job_fields(result))
     save_job(data_root, job)
     try:
         post_refresh_callback(request, refresh_success_callback_payload(result))
-    except Exception as exc:
-        job.update({"callbackError": str(exc)})
-        save_job(data_root, job)
+    except Exception as callback_exc:
+        save_callback_error(data_root, job, callback_exc)
