@@ -104,19 +104,31 @@ JsonScalar = str | int | float | bool | date | datetime | None
 
 
 class AnalyticsSource(StrictModel):
-    source_kind: Literal["USER_DATST"] = Field(alias="sourceKind")
-    user_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="userId")
-    user_dataset_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="userDatasetId")
-    user_dataset_file_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="userDatasetFileId")
+    source_kind: Literal["USER_DATST", "MTDT_TBL"] = Field(alias="sourceKind")
+    user_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="userId")
+    user_dataset_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="userDatasetId")
+    user_dataset_file_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="userDatasetFileId")
+    metadata_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="metadataId")
+    metadata_table_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="metadataTableId")
 
-    @field_validator("user_id", "user_dataset_id", "user_dataset_file_id")
+    @field_validator("user_id", "user_dataset_id", "user_dataset_file_id", "metadata_id", "metadata_table_id")
     @classmethod
-    def reject_path_patterns(cls, value: str) -> str:
+    def reject_path_patterns(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         if any(character in value for character in "*?[]{}"):
             raise ValueError("USER_DATST identifiers must not contain glob pattern characters")
         if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
             raise ValueError("USER_DATST identifiers must be safe path segments")
         return value
+
+    @model_validator(mode="after")
+    def require_source_identity(self) -> "AnalyticsSource":
+        if self.source_kind == "USER_DATST" and not all((self.user_id, self.user_dataset_id, self.user_dataset_file_id)):
+            raise ValueError("USER_DATST source identifiers are required")
+        if self.source_kind == "MTDT_TBL" and not all((self.metadata_id, self.metadata_table_id)):
+            raise ValueError("MTDT_TBL source identifiers are required")
+        return self
 
 
 class AnalyticsBin(StrictModel):

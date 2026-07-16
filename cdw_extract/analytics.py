@@ -42,9 +42,12 @@ def _max_source_bytes() -> int:
 
 def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRequest | AnalyticsDetailRequest) -> str:
     material = {
+        "sourceKind": request.source.source_kind,
         "userId": request.source.user_id,
         "userDatasetId": request.source.user_dataset_id,
         "userDatasetFileId": request.source.user_dataset_file_id,
+        "metadataId": request.source.metadata_id,
+        "metadataTableId": request.source.metadata_table_id,
         "checksumSha256": manifest.get("checksumSha256") or manifest.get("checksum"),
         "jobId": manifest.get("jobId"),
         "requestId": manifest.get("requestId"),
@@ -64,20 +67,19 @@ def _resolve_source(
     request: AnalyticsQueryRequest | AnalyticsDetailRequest,
     data_root: str | Path,
 ) -> tuple[Path, dict, str]:
-    resolver = SourceResolver("", data_root)
     source = request.source
+    resolver = SourceResolver(source.metadata_id or "", data_root)
     source_reference = source.model_dump(by_alias=True)
+    if source.source_kind == "MTDT_TBL":
+        source_reference["tableId"] = source.metadata_table_id
     source_path = resolver.table_path(source_reference).resolve()
     if any(character in source_path.as_posix() for character in "*?[]{}"):
         raise ValueError("resolved analytics source path must not contain glob pattern characters")
     resolved_root = Path(data_root).resolve()
     if not source_path.is_relative_to(resolved_root):
         raise ValueError("resolved analytics source must remain beneath DATA_ROOT")
-    manifest = resolver.user_dataset_file_manifest(
-        source.user_id,
-        source.user_dataset_id,
-        source.user_dataset_file_id,
-    )
+    manifest = (resolver.connection_manifest() if source.source_kind == "MTDT_TBL" else
+                resolver.user_dataset_file_manifest(source.user_id, source.user_dataset_id, source.user_dataset_file_id))
     size = source_path.stat().st_size
     maximum = _max_source_bytes()
     if size > maximum:
