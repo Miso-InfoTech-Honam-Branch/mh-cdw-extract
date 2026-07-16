@@ -90,6 +90,8 @@ class ExpressionOp(str, Enum):
     CONCAT = "CONCAT"
     DATE_DIFF = "DATE_DIFF"
     DATE_PART = "DATE_PART"
+    PARSE_DATE = "PARSE_DATE"
+    PARSE_NUMBER = "PARSE_NUMBER"
     CASE = "CASE"
 
 
@@ -247,6 +249,8 @@ class CalculatedExpression(StrictModel):
     args: Annotated[list["CalculatedExpression"], Field(max_length=20)] = Field(default_factory=list)
     unit: TimeGrain | None = None
     separator: Annotated[str, Field(max_length=20)] | None = None
+    format: Annotated[str, Field(min_length=1, max_length=40)] | None = None
+    on_error: Literal["NULL"] | None = Field(default=None, alias="onError")
     branches: Annotated[list["CalculatedCaseBranch"], Field(max_length=20)] = Field(default_factory=list)
     else_expression: "CalculatedExpression | None" = Field(default=None, alias="else")
 
@@ -260,6 +264,8 @@ class CalculatedExpression(StrictModel):
             raise ValueError("unit is valid only for DATE_DIFF or DATE_PART")
         if self.op != ExpressionOp.CONCAT and self.separator:
             raise ValueError("separator is valid only for CONCAT")
+        if self.op not in {ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and (self.format or self.on_error):
+            raise ValueError("format and onError are valid only for parse expressions")
         binary = {
             ExpressionOp.ADD, ExpressionOp.SUBTRACT, ExpressionOp.MULTIPLY, ExpressionOp.DIVIDE,
             ExpressionOp.EQ, ExpressionOp.NE, ExpressionOp.GT, ExpressionOp.GTE, ExpressionOp.LT,
@@ -273,7 +279,7 @@ class CalculatedExpression(StrictModel):
                 raise ValueError("LITERAL requires only value")
         elif self.op in binary and len(self.args) != 2:
             raise ValueError(f"{self.op.value} requires exactly two args")
-        elif self.op in {ExpressionOp.NOT, ExpressionOp.DATE_PART} and len(self.args) != 1:
+        elif self.op in {ExpressionOp.NOT, ExpressionOp.DATE_PART, ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and len(self.args) != 1:
             raise ValueError(f"{self.op.value} requires exactly one arg")
         elif self.op == ExpressionOp.COALESCE and not (2 <= len(self.args) <= 20):
             raise ValueError("COALESCE requires between two and twenty args")
@@ -283,6 +289,15 @@ class CalculatedExpression(StrictModel):
             raise ValueError("DATE_DIFF requires unit")
         elif self.op == ExpressionOp.DATE_PART and self.unit is None:
             raise ValueError("DATE_PART requires unit")
+        elif self.op == ExpressionOp.PARSE_DATE and self.format not in {
+            "YYMMDD", "YYYYMMDD", "YYYY-MM-DD", "YYYY/MM/DD",
+            "YYYYMMDDHH24MISS", "YYYY-MM-DD HH24:MI:SS",
+        }:
+            raise ValueError("PARSE_DATE requires a supported format")
+        elif self.op == ExpressionOp.PARSE_NUMBER and self.format not in {"PLAIN", "THOUSANDS_COMMA"}:
+            raise ValueError("PARSE_NUMBER requires a supported format")
+        if self.op in {ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and self.on_error != "NULL":
+            raise ValueError("parse expressions currently require onError=NULL")
         elif self.op == ExpressionOp.CASE:
             if not self.branches or self.else_expression is None or self.args:
                 raise ValueError("CASE requires branches and else")

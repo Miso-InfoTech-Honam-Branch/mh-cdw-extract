@@ -241,6 +241,22 @@ class AnalyticsCompiler:
             if kinds[0] not in {"temporal", "unknown"}:
                 raise ValueError("DATE_PART accepts only a temporal operand")
             return f"date_part('{expression.unit.value.lower()}', {sql_args[0]})", parameters, "numeric"
+        if op == ExpressionOp.PARSE_DATE:
+            formats = {
+                "YYMMDD": "%y%m%d",
+                "YYYYMMDD": "%Y%m%d",
+                "YYYY-MM-DD": "%Y-%m-%d",
+                "YYYY/MM/DD": "%Y/%m/%d",
+                "YYYYMMDDHH24MISS": "%Y%m%d%H%M%S",
+                "YYYY-MM-DD HH24:MI:SS": "%Y-%m-%d %H:%M:%S",
+            }
+            date_format = formats[expression.format or ""]
+            return f"try_strptime(CAST({sql_args[0]} AS VARCHAR), '{date_format}')", parameters, "temporal"
+        if op == ExpressionOp.PARSE_NUMBER:
+            source = f"CAST({sql_args[0]} AS VARCHAR)"
+            if expression.format == "THOUSANDS_COMMA":
+                source = f"replace({source}, ',', '')"
+            return f"TRY_CAST({source} AS DOUBLE)", parameters, "numeric"
         if op == ExpressionOp.CASE:
             pieces: list[str] = []
             branch_parameters: list[object] = []

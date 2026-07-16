@@ -119,6 +119,38 @@ def run(data_root: str, payload: dict) -> AnalyticsQueryResponse:
 
 
 class AnalyticsQueryTest(unittest.TestCase):
+    def test_parse_date_and_number_calculated_fields_are_queryable(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+            payload = request_payload(
+                "LINE",
+                {
+                    "category": {"derivedFieldId": "parsedDate", "timeGrain": "MONTH"},
+                    "value": {"derivedFieldId": "parsedNumber", "aggregation": "SUM"},
+                },
+            )
+            payload["calculatedFields"] = [
+                {
+                    "id": "parsedDate", "name": "Parsed date", "dataType": "DATE",
+                    "formula": {
+                        "op": "PARSE_DATE", "args": [{"op": "COLUMN", "column": "event_date"}],
+                        "format": "YYYY-MM-DD", "onError": "NULL",
+                    },
+                },
+                {
+                    "id": "parsedNumber", "name": "Parsed number", "dataType": "NUMBER",
+                    "formula": {
+                        "op": "PARSE_NUMBER", "args": [{"op": "COLUMN", "column": "value"}],
+                        "format": "PLAIN", "onError": "NULL",
+                    },
+                },
+            ]
+
+            response = run(data_root, payload)
+
+            self.assertTrue(response.rows)
+            self.assertTrue(all(row["value"] is not None for row in response.rows))
+
     def test_eight_chart_happy_paths_use_actual_parquet(self):
         with tempfile.TemporaryDirectory() as data_root:
             create_source(data_root)
