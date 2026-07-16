@@ -509,14 +509,14 @@ class AnalyticsQueryTest(unittest.TestCase):
             self.assertIs(AnalyticsQueryResponse, route.response_model)
 
             with patch.dict("os.environ", {"ANALYTICS_MAX_SOURCE_BYTES": "1"}):
-                with self.assertRaisesRegex(ValueError, "source Parquet exceeds"):
-                    run(
-                        data_root,
-                        request_payload(
-                            "BAR",
-                            {"category": {"column": "category"}, "value": {"aggregation": "COUNT"}},
-                        ),
-                    )
+                sliced = run(
+                    data_root,
+                    request_payload(
+                        "BAR",
+                        {"category": {"column": "category"}, "value": {"aggregation": "COUNT"}},
+                    ),
+                )
+                self.assertTrue(any("first" in warning and "rows were analyzed" in warning for warning in sliced.warnings))
 
 
 if __name__ == "__main__":

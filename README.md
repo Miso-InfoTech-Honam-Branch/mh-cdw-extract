@@ -128,7 +128,8 @@ be removed by the caller.
 The service re-reads the Parquet schema, validates every referenced column and
 role, quotes identifiers, and binds filter values. Defaults cap source files at
 256 MiB, results at 2,000 rows, DuckDB memory at 256 MiB, execution at 5 seconds,
-and scatter reservoir samples at 1,000 points. `ANALYTICS_MAX_SOURCE_BYTES` can
+and scatter reservoir samples at 1,000 points. Sources up to 3 GiB are analyzed in full;
+larger Parquet sources are analyzed from a proportional leading row slice. `ANALYTICS_MAX_SOURCE_BYTES` can
 set the deployment source-file cap. Any omitted result rows set `truncated=true`
 and add a warning; dates are ISO strings and non-finite numbers become JSON null
 with a warning.

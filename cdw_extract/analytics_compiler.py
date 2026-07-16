@@ -105,10 +105,12 @@ class AnalyticsCompiler:
         request: AnalyticsQueryRequest,
         parquet_path: str | Path,
         schema: list[tuple[str, str]],
+        source_row_limit: int | None = None,
     ):
         self.request = request
         self.parquet_path = Path(parquet_path).as_posix()
         self.schema = {name: ColumnInfo(name, duckdb_type) for name, duckdb_type in schema}
+        self.source_row_limit = source_row_limit
         if not self.schema:
             raise ValueError("source Parquet schema is empty")
         self.calculated_columns: dict[str, ColumnInfo] = {}
@@ -272,9 +274,12 @@ class AnalyticsCompiler:
         raise ValueError(f"unsupported calculated expression op: {op.value}")
 
     def _source_sql(self) -> str:
-        base = f"read_parquet(?) AS {quote_ident('__raw')}"
+        relation = "read_parquet(?)"
+        if self.source_row_limit is not None:
+            relation = f"(SELECT * FROM read_parquet(?) LIMIT {self.source_row_limit})"
+        base = f"{relation} AS {quote_ident('__raw')}"
         if not self._calculated_selects:
-            return f"read_parquet(?) AS {quote_ident('__src')}"
+            return f"{relation} AS {quote_ident('__src')}"
         return (
             f"(SELECT {quote_ident('__raw')}.*, {', '.join(self._calculated_selects)} "
             f"FROM {base}) AS {quote_ident('__src')}"
@@ -989,8 +994,9 @@ class AnalyticsDetailCompiler(AnalyticsCompiler):
         request: AnalyticsDetailRequest,
         parquet_path: str | Path,
         schema: list[tuple[str, str]],
+        source_row_limit: int | None = None,
     ):
-        super().__init__(request, parquet_path, schema)  # type: ignore[arg-type]
+        super().__init__(request, parquet_path, schema, source_row_limit)  # type: ignore[arg-type]
         self.request: AnalyticsDetailRequest = request
 
     def compile(self) -> CompiledDetailQuery:

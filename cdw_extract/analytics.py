@@ -24,7 +24,7 @@ from cdw_extract.duck import connect
 from cdw_extract.query import SourceResolver
 
 
-DEFAULT_MAX_SOURCE_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_SOURCE_BYTES = 3 * 1024 * 1024 * 1024
 
 
 def _max_source_bytes() -> int:
@@ -66,7 +66,7 @@ def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRe
 def _resolve_source(
     request: AnalyticsQueryRequest | AnalyticsDetailRequest,
     data_root: str | Path,
-) -> tuple[Path, dict, str]:
+) -> tuple[Path, dict, str, int]:
     source = request.source
     resolver = SourceResolver(source.metadata_id or "", data_root)
     source_reference = source.model_dump(by_alias=True)
@@ -81,10 +81,26 @@ def _resolve_source(
     manifest = (resolver.connection_manifest() if source.source_kind == "MTDT_TBL" else
                 resolver.user_dataset_file_manifest(source.user_id, source.user_dataset_id, source.user_dataset_file_id))
     size = source_path.stat().st_size
+    return source_path, manifest, _source_version(manifest, source_path, request), size
+
+
+def _source_slice(connection, source_path: Path, source_bytes: int) -> tuple[int | None, str | None]:
     maximum = _max_source_bytes()
-    if size > maximum:
-        raise ValueError(f"source Parquet exceeds synchronous analytics cap ({size} > {maximum} bytes)")
-    return source_path, manifest, _source_version(manifest, source_path, request)
+    if source_bytes <= maximum:
+        return None, None
+    row = connection.execute(
+        "SELECT coalesce(sum(row_group_num_rows), 0) FROM parquet_metadata(?)",
+        [source_path.as_posix()],
+    ).fetchone()
+    total_rows = int(row[0] or 0)
+    if total_rows < 1:
+        raise ValueError("source Parquet contains no rows")
+    selected_rows = max(1, min(total_rows, int(total_rows * maximum / source_bytes)))
+    warning = (
+        f"Source Parquet is larger than the {maximum}-byte analytics cap; "
+        f"the first {selected_rows:,} of {total_rows:,} rows were analyzed."
+    )
+    return selected_rows, warning
 
 
 def _json_value(value: object, warnings: list[str]) -> object:
@@ -164,19 +180,20 @@ def run_analytics_query(
     data_root: str | Path,
 ) -> AnalyticsQueryResponse:
     started = time.perf_counter()
-    source_path, _manifest, source_version = _resolve_source(request, data_root)
+    source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics", request.request_id)
     try:
         options = request.options
         connection.execute(f"SET memory_limit='{options.memory_limit_mb}MB'")
         connection.execute(f"SET threads={options.threads}")
         connection.execute("SET preserve_insertion_order=false")
+        source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)",
             [source_path.as_posix()],
         ).fetchall()
         schema = [(str(row[0]), str(row[1])) for row in schema_rows]
-        compiled = AnalyticsCompiler(request, source_path, schema).compile()
+        compiled = AnalyticsCompiler(request, source_path, schema, source_row_limit).compile()
         names, raw_rows = _fetch_with_timeout(
             connection,
             compiled.sql,
@@ -199,10 +216,12 @@ def run_analytics_query(
         raw_rows = [tuple(row[index] for index in visible_indices) for row in raw_rows]
 
     warnings = list(compiled.warnings)
-    truncated = compiled.detect_truncation and len(raw_rows) > compiled.row_limit
+    if source_warning:
+        warnings.append(source_warning)
+    result_truncated = compiled.detect_truncation and len(raw_rows) > compiled.row_limit
     if len(raw_rows) > compiled.row_limit:
         raw_rows = raw_rows[: compiled.row_limit]
-        if truncated:
+        if result_truncated:
             warnings.append(
                 f"Result exceeded the {compiled.row_limit}-row cap; additional rows were omitted."
             )
@@ -239,6 +258,9 @@ def run_analytics_query(
         "appliedFilterCount": len(request.all_filters),
         "valueTransform": request.options.value_transform.value,
     }
+    if source_row_limit is not None:
+        metadata["sourceTruncated"] = True
+        metadata["analyzedSourceRows"] = source_row_limit
     if request.top_n and request.top_n.enabled:
         metadata["topN"] = request.top_n.model_dump(by_alias=True, mode="json")
     if request.drilldown:
@@ -256,7 +278,7 @@ def run_analytics_query(
         sourceVersion=source_version,
         elapsedMs=elapsed_ms,
         rowCount=len(rows),
-        truncated=truncated,
+        truncated=result_truncated or source_row_limit is not None,
         warnings=warnings,
         columns=compiled.columns,
         rows=rows,
@@ -270,18 +292,19 @@ def run_analytics_detail(
     data_root: str | Path,
 ) -> AnalyticsDetailResponse:
     started = time.perf_counter()
-    source_path, _manifest, source_version = _resolve_source(request, data_root)
+    source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics-detail", request.request_id)
     try:
         options = request.options
         connection.execute(f"SET memory_limit='{options.memory_limit_mb}MB'")
         connection.execute(f"SET threads={options.threads}")
         connection.execute("SET preserve_insertion_order=false")
+        source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)", [source_path.as_posix()]
         ).fetchall()
         schema = [(str(row[0]), str(row[1])) for row in schema_rows]
-        compiled = AnalyticsDetailCompiler(request, source_path, schema).compile()
+        compiled = AnalyticsDetailCompiler(request, source_path, schema, source_row_limit).compile()
         names, raw_rows = _fetch_with_timeout(
             connection,
             compiled.sql,
@@ -294,6 +317,8 @@ def run_analytics_detail(
     has_more = len(raw_rows) > compiled.row_limit
     raw_rows = raw_rows[: compiled.row_limit]
     warnings: list[str] = []
+    if source_warning:
+        warnings.append(source_warning)
     rows = [
         {name: _json_value(value, warnings) for name, value in zip(names, raw_row)}
         for raw_row in raw_rows
