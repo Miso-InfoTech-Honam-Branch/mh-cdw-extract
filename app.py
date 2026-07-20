@@ -1,3 +1,9 @@
+"""개발 및 통합 테스트용 HTTP 어댑터.
+
+운영 환경의 API 라우팅과 백그라운드 실행은 모듈을 탑재하는 호스트 프로젝트가 담당한다.
+핵심 기능은 이 파일이 아니라 ``cdw_extract``의 공개 함수에 둔다.
+"""
+
 from __future__ import annotations
 
 import os
@@ -114,10 +120,10 @@ def create_analysis_artifact_route(
         raise to_http_error(exc) from exc
 
 
-@app.get("/api/v1/analytics/artifacts/{userId}/{artifactId}/download")
-def download_analysis_artifact_route(userId: str, artifactId: str) -> FileResponse:
+@app.get("/api/v1/analytics/artifacts/{userId}/{analysisArtifactId}/download")
+def download_analysis_artifact_route(userId: str, analysisArtifactId: str) -> FileResponse:
     try:
-        path, manifest = analysis_artifact_download(root_path(), userId, artifactId)
+        path, manifest = analysis_artifact_download(root_path(), userId, analysisArtifactId)
         return FileResponse(
             path,
             media_type=manifest["contentType"],
@@ -127,10 +133,10 @@ def download_analysis_artifact_route(userId: str, artifactId: str) -> FileRespon
         raise to_http_error(exc) from exc
 
 
-@app.delete("/api/v1/analytics/artifacts/{userId}/{artifactId}")
-def delete_analysis_artifact_route(userId: str, artifactId: str) -> dict:
+@app.delete("/api/v1/analytics/artifacts/{userId}/{analysisArtifactId}")
+def delete_analysis_artifact_route(userId: str, analysisArtifactId: str) -> dict:
     try:
-        return delete_analysis_artifact(root_path(), userId, artifactId)
+        return delete_analysis_artifact(root_path(), userId, analysisArtifactId)
     except Exception as exc:
         raise to_http_error(exc) from exc
 

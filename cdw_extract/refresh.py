@@ -9,6 +9,7 @@ from pathlib import Path
 
 import requests
 
+from .callback import callback_options as normalized_callback_options, post_json_callback
 from .clickhouse import write_clickhouse_table_parquet
 from .duck import connect, source_attach_sql, source_table_sql
 from .jobs import save_job
@@ -100,41 +101,22 @@ def success_job_fields(result: dict) -> dict:
 
 
 def callback_options(request: dict) -> dict:
-    callback = request.get("callback") or {}
-    if not isinstance(callback, dict):
-        callback = {}
-    if request.get("callbackUrl") and not callback.get("url"):
-        callback = {**callback, "url": request["callbackUrl"]}
-    return callback
+    return normalized_callback_options(request, legacy_url_key="callbackUrl")
 
 
 def post_refresh_callback(request: dict, payload: dict) -> dict | None:
-    callback = callback_options(request)
-    url = callback.get("url")
-    if not url:
-        return None
-
-    headers = callback.get("headers") or {}
-    timeout = float(callback.get("timeoutSeconds") or callback.get("timeout") or 10)
-    last_error: Exception | None = None
-    for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-            if 200 <= response.status_code < 300:
-                return {"url": url, "statusCode": response.status_code, "attempts": attempt}
-            message = response.text[:4096].strip()
-            last_error = RuntimeError(
-                f"refresh callback failed status={response.status_code} body={message}"
-            )
-        except requests.RequestException as exc:
-            last_error = exc
-
-        if attempt < CALLBACK_MAX_ATTEMPTS:
-            time.sleep(CALLBACK_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-
-    if last_error is None:
-        last_error = RuntimeError("refresh callback failed without a response")
-    raise last_error
+    return post_json_callback(
+        callback_options(request),
+        payload,
+        operation="refresh",
+        attempts=CALLBACK_MAX_ATTEMPTS,
+        backoff_seconds=tuple(
+            CALLBACK_INITIAL_BACKOFF_SECONDS * (2 ** index)
+            for index in range(CALLBACK_MAX_ATTEMPTS - 1)
+        ),
+        post=requests.post,
+        wait=time.sleep,
+    )
 
 
 def refresh_success_callback_payload(result: dict) -> dict:

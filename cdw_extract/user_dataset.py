@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+from .callback import callback_options as normalized_callback_options, post_json_callback
 from openpyxl import load_workbook
 
 from .duck import connect, sql_literal
@@ -127,14 +129,14 @@ def publish_dataset_file_artifact(
         "manifestPath": dataset_file_manifest_relative_path(user_id, user_dataset_id, user_dataset_file_id),
         "fileType": "PARQUET",
         "sizeBytes": staged_parquet_path.stat().st_size,
-        "checksumSha256": file_sha256(staged_parquet_path),
+        "sha256Checksum": file_sha256(staged_parquet_path),
         "status": "SUCCESS",
     }
 
     if final_file_root.exists():
         existing = load_dataset_file_manifest(data_root, user_id, user_dataset_id, user_dataset_file_id)
         same_key = existing.get("idempotencyKey") == normalized_manifest.get("idempotencyKey")
-        same_checksum = existing.get("checksumSha256") == normalized_manifest.get("checksumSha256")
+        same_checksum = existing.get("sha256Checksum") == normalized_manifest.get("sha256Checksum")
         if same_key and same_checksum and existing.get("status") == "SUCCESS":
             return existing
         raise FileExistsError(f"user dataset result target already exists: {final_file_root}")
@@ -366,21 +368,19 @@ def parquet_row_count(
 
 
 def callback_options(request: dict) -> dict:
-    callback = request.get("callback") or {}
-    return callback if isinstance(callback, dict) else {}
+    return normalized_callback_options(request)
 
 
 def post_callback(request: dict, payload: dict) -> dict | None:
-    callback = callback_options(request)
-    url = callback.get("url")
-    if not url:
-        return None
-    headers = callback.get("headers") or {}
-    timeout = float(callback.get("timeoutSeconds") or callback.get("timeout") or 10)
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    if response.status_code < 200 or response.status_code >= 300:
-        raise RuntimeError(f"user dataset callback failed status={response.status_code} body={response.text[:4096].strip()}")
-    return {"url": url, "statusCode": response.status_code}
+    delivery = post_json_callback(
+        callback_options(request),
+        payload,
+        operation="user dataset",
+        post=requests.post,
+    )
+    if delivery is not None:
+        delivery.pop("attempts", None)
+    return delivery
 
 
 def convert_user_dataset_file_from_path(input_upload_path: Path, data_root: str | Path, request: dict) -> dict:

@@ -65,7 +65,7 @@ CHART_ENCODINGS = {
 
 def artifact_payload(
     output_format: str,
-    artifact_id: str,
+    analysis_artifact_id: str,
     *,
     all_charts: bool = False,
     callback: dict | None = None,
@@ -76,7 +76,7 @@ def artifact_payload(
     dashboard_charts = []
     for index, (chart_type, encoding) in enumerate(chart_items):
         query = request_payload(chart_type, encoding)
-        query["requestId"] = f"artifact-{artifact_id}-{chart_type.lower()}"
+        query["requestId"] = f"artifact-{analysis_artifact_id}-{chart_type.lower()}"
         chart_id = f"chart-{index + 1}"
         queries.append(
             {
@@ -96,11 +96,11 @@ def artifact_payload(
     payload = {
         "schemaVersion": 1,
         "jobId": str(uuid.uuid4()),
-        "requestId": f"request-{artifact_id}",
-        "artifactId": artifact_id,
+        "requestId": f"request-{analysis_artifact_id}",
+        "analysisArtifactId": analysis_artifact_id,
         "analysisId": "analysis-v2",
         "userId": USER_ID,
-        "name": f"Dashboard {artifact_id}",
+        "name": f"Dashboard {analysis_artifact_id}",
         "format": output_format,
         "spec": {
             "specVersion": 2,
@@ -525,11 +525,11 @@ class AnalyticsArtifactTest(unittest.TestCase):
             }
             for output_format, all_charts, signature in cases:
                 with self.subTest(output_format=output_format):
-                    artifact_id = f"artifact-{output_format.lower()}"
+                    analysis_artifact_id = f"artifact-{output_format.lower()}"
                     request = AnalyticsArtifactRequest.model_validate(
                         artifact_payload(
                             output_format,
-                            artifact_id,
+                            analysis_artifact_id,
                             all_charts=all_charts,
                             display_options=display_options,
                         )
@@ -537,10 +537,10 @@ class AnalyticsArtifactTest(unittest.TestCase):
                     accepted = prepare_analysis_artifact_job(request, data_root)
                     self.assertEqual("ACCEPTED", accepted["state"])
                     run_analysis_artifact_job(request, data_root)
-                    path, manifest = analysis_artifact_download(data_root, USER_ID, artifact_id)
+                    path, manifest = analysis_artifact_download(data_root, USER_ID, analysis_artifact_id)
                     self.assertTrue(path.read_bytes().startswith(signature))
                     self.assertEqual(8, manifest["chartCount"])
-                    self.assertTrue(manifest["checksumSha256"])
+                    self.assertTrue(manifest["sha256Checksum"])
                     self.assertGreater(manifest["sizeBytes"], 100)
                     if output_format == "XLSX":
                         workbook = load_workbook(path)
@@ -631,7 +631,7 @@ class AnalyticsArtifactTest(unittest.TestCase):
             self.assertEqual("SUCCESS", job["state"])
             self.assertEqual(3, job["callbackAttempts"])
             self.assertIn("relativePath", job)
-            self.assertIn("checksumSha256", job)
+            self.assertIn("sha256Checksum", job)
             self.assertIn("sourceVersion", job)
 
     def test_routes_publish_detail_artifact_download_and_delete_contracts(self):
@@ -640,8 +640,8 @@ class AnalyticsArtifactTest(unittest.TestCase):
         self.assertEqual(200, routes["/api/v1/analytics/detail"].status_code)
         self.assertIn("/api/v1/analytics/artifacts", routes)
         self.assertEqual(202, routes["/api/v1/analytics/artifacts"].status_code)
-        self.assertIn("/api/v1/analytics/artifacts/{userId}/{artifactId}/download", routes)
-        self.assertIn("/api/v1/analytics/artifacts/{userId}/{artifactId}", routes)
+        self.assertIn("/api/v1/analytics/artifacts/{userId}/{analysisArtifactId}/download", routes)
+        self.assertIn("/api/v1/analytics/artifacts/{userId}/{analysisArtifactId}", routes)
 
 
 if __name__ == "__main__":

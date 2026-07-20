@@ -1,3 +1,9 @@
+"""검증된 분석 DSL을 DuckDB SQL과 바인딩 파라미터로 변환한다.
+
+이 모듈은 외부 SQL 표현식을 허용하지 않는 보안 경계다. 새 연산자를 추가할 때에는 지원 타입,
+식별자 인용, 파라미터 바인딩과 표현식 복잡도 제한을 함께 검토한다.
+"""
+
 from __future__ import annotations
 
 import math
@@ -98,7 +104,7 @@ _CALCULATED_TYPE_KIND = {
 
 
 class AnalyticsCompiler:
-    """Compiles the closed analytics DSL; it never accepts SQL expressions."""
+    """폐쇄형 분석 DSL을 컴파일한다. 호출자로부터 SQL 표현식을 직접 받지 않는다."""
 
     def __init__(
         self,

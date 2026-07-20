@@ -260,7 +260,7 @@ def execute_extract(
                 "manifestPath": manifest["manifestPath"],
                 "rowCount": published_row_count,
                 "sizeBytes": manifest.get("sizeBytes"),
-                "checksumSha256": manifest.get("checksumSha256"),
+                "sha256Checksum": manifest.get("sha256Checksum"),
                 "columns": published_columns,
             },
             "_resultTarget": True,

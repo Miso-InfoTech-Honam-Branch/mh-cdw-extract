@@ -2,6 +2,9 @@
 
 Python function-first extraction module with a thin FastAPI test wrapper.
 
+프로젝트 책임, 변경 위치와 코드 작성 규칙은 [개발 가이드](docs/DEVELOPMENT.md)를 먼저 확인하세요.
+다른 작업 실행 서비스에 탑재할 때의 경계는 [모듈 내장 가이드](docs/EMBEDDING.md)에 정리되어 있습니다.
+
 ## Install
 
 ```bash
@@ -358,7 +361,7 @@ whitelisted worker query fields. The raw dashboard snapshot may be retained in
   "schemaVersion": 1,
   "jobId": "a89dfc80-51cc-4b3c-89b4-c4e90adf1bb2",
   "requestId": "artifact-request-1",
-  "artifactId": "artifact-1",
+  "analysisArtifactId": "artifact-1",
   "analysisId": "analysis-1",
   "userId": "user-1",
   "name": "July dashboard",
@@ -408,7 +411,7 @@ The accepted response is:
   "jobId": "a89dfc80-51cc-4b3c-89b4-c4e90adf1bb2",
   "jobType": "ANALYSIS_ARTIFACT",
   "requestId": "artifact-request-1",
-  "artifactId": "artifact-1",
+  "analysisArtifactId": "artifact-1",
   "analysisId": "analysis-1",
   "userId": "user-1",
   "state": "ACCEPTED"
@@ -431,13 +434,13 @@ Artifacts are built below `_staging/{jobId}` using `.part` files, then the file
 and READY manifest directory are atomically renamed to:
 
 ```text
-${DATA_ROOT}/analysis-artifacts/{userId}/{artifactId}/files/{name}.{png|pdf|xlsx}
-${DATA_ROOT}/analysis-artifacts/{userId}/{artifactId}/meta/manifest.json
+${DATA_ROOT}/analysis-artifacts/{userId}/{analysisArtifactId}/files/{name}.{png|pdf|xlsx}
+${DATA_ROOT}/analysis-artifacts/{userId}/{analysisArtifactId}/meta/manifest.json
 ```
 
 The terminal callback is retried up to three times and includes `jobId`, all
 three identities, `status`, `fileName`, `relativePath`, `contentType`,
-`sizeBytes`, `checksumSha256`, `sourceVersion`, `errorCode`, and `message`. The same metadata is
+`sizeBytes`, `sha256Checksum`, `sourceVersion`, `errorCode`, and `message`. The same metadata is
 kept in `GET /api/v1/jobs/{jobId}` so Boot can reconcile a lost callback.
 
 Headless Matplotlib rendering is serialized by default because its global font
@@ -451,8 +454,8 @@ slot, checking cancellation while queued; a timeout finishes the job as
 Worker storage does not need to be shared with Boot. Boot proxies:
 
 ```text
-GET    /api/v1/analytics/artifacts/{userId}/{artifactId}/download
-DELETE /api/v1/analytics/artifacts/{userId}/{artifactId}
+GET    /api/v1/analytics/artifacts/{userId}/{analysisArtifactId}/download
+DELETE /api/v1/analytics/artifacts/{userId}/{analysisArtifactId}
 ```
 
 Download verifies READY state, identity, canonical path, byte size, and SHA-256

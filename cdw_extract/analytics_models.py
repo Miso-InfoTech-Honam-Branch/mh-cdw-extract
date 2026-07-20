@@ -526,7 +526,7 @@ class AnalyticsArtifactRequest(StrictModel):
     schema_version: Literal[1] = Field(alias="schemaVersion")
     job_id: Annotated[str, Field(min_length=1, max_length=100)] = Field(alias="jobId")
     request_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="requestId")
-    artifact_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="artifactId")
+    analysis_artifact_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="analysisArtifactId")
     analysis_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="analysisId")
     user_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="userId")
     name: Annotated[str, Field(min_length=1, max_length=255)]
@@ -539,7 +539,7 @@ class AnalyticsArtifactAccepted(StrictModel):
     job_id: str = Field(alias="jobId")
     job_type: Literal["ANALYSIS_ARTIFACT"] = Field(default="ANALYSIS_ARTIFACT", alias="jobType")
     request_id: str = Field(alias="requestId")
-    artifact_id: str = Field(alias="artifactId")
+    analysis_artifact_id: str = Field(alias="analysisArtifactId")
     analysis_id: str = Field(alias="analysisId")
     user_id: str = Field(alias="userId")
     state: Literal["ACCEPTED"] = "ACCEPTED"

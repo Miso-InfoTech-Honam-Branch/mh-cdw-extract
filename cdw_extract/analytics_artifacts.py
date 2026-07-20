@@ -1,3 +1,9 @@
+"""분석 결과를 PNG·PDF·XLSX 파일로 생성하고 작업 상태와 콜백을 관리한다.
+
+렌더러는 프로세스 메모리를 많이 사용하므로 동시 실행 수를 제한한다. 결과 파일은 부분 생성물이
+완성본으로 보이지 않도록 임시 경로에 쓴 뒤 원자적으로 게시한다.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +23,7 @@ from typing import Iterator
 
 import requests
 
+from cdw_extract.callback import post_json_callback
 from cdw_extract.analytics import run_analytics_query
 from cdw_extract.analytics_models import (
     AnalyticsArtifactRequest,
@@ -114,55 +121,55 @@ def artifacts_root(data_root: str | Path) -> Path:
     return Path(data_root).expanduser().resolve() / "analysis-artifacts"
 
 
-def artifact_root(data_root: str | Path, user_id: str, artifact_id: str) -> Path:
+def artifact_root(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
     return (
         artifacts_root(data_root)
         / _identity_segment(user_id, "userId")
-        / _identity_segment(artifact_id, "artifactId")
+        / _identity_segment(analysis_artifact_id, "analysisArtifactId")
     )
 
 
-def artifact_manifest_path(data_root: str | Path, user_id: str, artifact_id: str) -> Path:
-    return artifact_root(data_root, user_id, artifact_id) / "meta" / "manifest.json"
+def artifact_manifest_path(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
+    return artifact_root(data_root, user_id, analysis_artifact_id) / "meta" / "manifest.json"
 
 
-def artifact_relative_path(user_id: str, artifact_id: str, file_name: str) -> str:
+def artifact_relative_path(user_id: str, analysis_artifact_id: str, file_name: str) -> str:
     return (
         f"analysis-artifacts/{_identity_segment(user_id, 'userId')}/"
-        f"{_identity_segment(artifact_id, 'artifactId')}/files/{file_name}"
+        f"{_identity_segment(analysis_artifact_id, 'analysisArtifactId')}/files/{file_name}"
     )
 
 
-def _reservation_path(data_root: str | Path, user_id: str, artifact_id: str) -> Path:
+def _reservation_path(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
     return (
         artifacts_root(data_root)
         / "_reservations"
         / _identity_segment(user_id, "userId")
-        / f"{_identity_segment(artifact_id, 'artifactId')}.json"
+        / f"{_identity_segment(analysis_artifact_id, 'analysisArtifactId')}.json"
     )
 
 
-def _tombstone_path(data_root: str | Path, user_id: str, artifact_id: str) -> Path:
+def _tombstone_path(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
     return (
         artifacts_root(data_root)
         / "_tombstones"
         / _identity_segment(user_id, "userId")
-        / f"{_identity_segment(artifact_id, 'artifactId')}.json"
+        / f"{_identity_segment(analysis_artifact_id, 'analysisArtifactId')}.json"
     )
 
 
-def _lock_path(data_root: str | Path, user_id: str, artifact_id: str) -> Path:
+def _lock_path(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
     return (
         artifacts_root(data_root)
         / "_locks"
         / _identity_segment(user_id, "userId")
-        / f"{_identity_segment(artifact_id, 'artifactId')}.lock"
+        / f"{_identity_segment(analysis_artifact_id, 'analysisArtifactId')}.lock"
     )
 
 
 @contextmanager
-def _artifact_lock(data_root: str | Path, user_id: str, artifact_id: str) -> Iterator[None]:
-    path = _lock_path(data_root, user_id, artifact_id)
+def _artifact_lock(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Iterator[None]:
+    path = _lock_path(data_root, user_id, analysis_artifact_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as file:
         file.seek(0, os.SEEK_END)
@@ -223,8 +230,8 @@ def _accepted(request: AnalyticsArtifactRequest) -> dict:
     return {
         "jobId": request.job_id,
         "jobType": ANALYSIS_ARTIFACT,
-        "requestId": request.request_id or request.artifact_id,
-        "artifactId": request.artifact_id,
+        "requestId": request.request_id or request.analysis_artifact_id,
+        "analysisArtifactId": request.analysis_artifact_id,
         "analysisId": request.analysis_id,
         "userId": request.user_id,
         "state": "ACCEPTED",
@@ -251,42 +258,42 @@ def prepare_analysis_artifact_job(
     normalized = request.model_copy(
         update={
             "job_id": normalize_job_id(request.job_id),
-            "request_id": request.request_id or request.artifact_id,
+            "request_id": request.request_id or request.analysis_artifact_id,
             "user_id": _identity_segment(request.user_id, "userId"),
-            "artifact_id": _identity_segment(request.artifact_id, "artifactId"),
+            "analysis_artifact_id": _identity_segment(request.analysis_artifact_id, "analysisArtifactId"),
         }
     )
     spec_hash = _spec_fingerprint(normalized.spec)
-    with _artifact_lock(data_root, normalized.user_id, normalized.artifact_id):
-        if _tombstone_path(data_root, normalized.user_id, normalized.artifact_id).exists():
-            raise ValueError("analysis artifact was deleted and cannot be recreated with the same artifactId")
-        final_manifest = artifact_manifest_path(data_root, normalized.user_id, normalized.artifact_id)
+    with _artifact_lock(data_root, normalized.user_id, normalized.analysis_artifact_id):
+        if _tombstone_path(data_root, normalized.user_id, normalized.analysis_artifact_id).exists():
+            raise ValueError("analysis artifact was deleted and cannot be recreated with the same analysisArtifactId")
+        final_manifest = artifact_manifest_path(data_root, normalized.user_id, normalized.analysis_artifact_id)
         if final_manifest.exists():
             existing_manifest = json.loads(final_manifest.read_text(encoding="utf-8"))
             if existing_manifest.get("jobId") != normalized.job_id:
-                raise ValueError("artifactId already belongs to a different completed job")
-        reservation_path = _reservation_path(data_root, normalized.user_id, normalized.artifact_id)
+                raise ValueError("analysisArtifactId already belongs to a different completed job")
+        reservation_path = _reservation_path(data_root, normalized.user_id, normalized.analysis_artifact_id)
         reservation_created = False
         if reservation_path.exists():
             reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
             expected = {
                 "jobId": normalized.job_id,
                 "userId": normalized.user_id,
-                "artifactId": normalized.artifact_id,
+                "analysisArtifactId": normalized.analysis_artifact_id,
                 "analysisId": normalized.analysis_id,
                 "format": normalized.format.value,
                 "name": normalized.name,
                 "specSha256": spec_hash,
             }
             if any(str(reservation.get(key)) != str(value) for key, value in expected.items()):
-                raise ValueError("artifactId is already reserved by a different job")
+                raise ValueError("analysisArtifactId is already reserved by a different job")
         else:
             _atomic_json(
                 reservation_path,
                 {
                     "jobId": normalized.job_id,
                     "userId": normalized.user_id,
-                    "artifactId": normalized.artifact_id,
+                    "analysisArtifactId": normalized.analysis_artifact_id,
                     "analysisId": normalized.analysis_id,
                     "format": normalized.format.value,
                     "name": normalized.name,
@@ -303,7 +310,7 @@ def prepare_analysis_artifact_job(
                     "jobId": normalized.job_id,
                     "jobType": ANALYSIS_ARTIFACT,
                     "requestId": normalized.request_id,
-                    "artifactId": normalized.artifact_id,
+                    "analysisArtifactId": normalized.analysis_artifact_id,
                     "analysisId": normalized.analysis_id,
                     "userId": normalized.user_id,
                     "format": normalized.format.value,
@@ -314,7 +321,7 @@ def prepare_analysis_artifact_job(
             )
             expected_job = {
                 "jobType": ANALYSIS_ARTIFACT,
-                "artifactId": normalized.artifact_id,
+                "analysisArtifactId": normalized.analysis_artifact_id,
                 "analysisId": normalized.analysis_id,
                 "userId": normalized.user_id,
                 "format": normalized.format.value,
@@ -330,12 +337,12 @@ def prepare_analysis_artifact_job(
     request.job_id = normalized.job_id
     request.request_id = normalized.request_id
     request.user_id = normalized.user_id
-    request.artifact_id = normalized.artifact_id
+    request.analysis_artifact_id = normalized.analysis_artifact_id
     return _accepted(request)
 
 
 def _check_cancelled(data_root: str | Path, request: AnalyticsArtifactRequest, event: threading.Event) -> None:
-    if event.is_set() or _tombstone_path(data_root, request.user_id, request.artifact_id).exists():
+    if event.is_set() or _tombstone_path(data_root, request.user_id, request.analysis_artifact_id).exists():
         raise ArtifactCancelled("Analysis artifact generation was cancelled by deletion.")
 
 
@@ -888,7 +895,7 @@ def _callback_payload(request: AnalyticsArtifactRequest, status: str, manifest: 
         "jobId": request.job_id,
         "jobType": ANALYSIS_ARTIFACT,
         "requestId": request.request_id,
-        "artifactId": request.artifact_id,
+        "analysisArtifactId": request.analysis_artifact_id,
         "analysisId": request.analysis_id,
         "userId": request.user_id,
         "status": status,
@@ -896,7 +903,7 @@ def _callback_payload(request: AnalyticsArtifactRequest, status: str, manifest: 
         "relativePath": manifest.get("relativePath") if manifest else None,
         "contentType": manifest.get("contentType") if manifest else None,
         "sizeBytes": manifest.get("sizeBytes") if manifest else None,
-        "checksumSha256": manifest.get("checksumSha256") if manifest else None,
+        "sha256Checksum": manifest.get("sha256Checksum") if manifest else None,
         "sourceVersion": manifest.get("sourceVersion") if manifest else None,
         "errorCode": type(exc).__name__ if exc else None,
         "message": str(exc) if exc else None,
@@ -907,15 +914,20 @@ def _post_callback(request: AnalyticsArtifactRequest, payload: dict) -> dict | N
     callback = request.callback
     if callback is None:
         return None
-    response = requests.post(
-        callback.url,
-        json=payload,
-        headers=callback.headers,
-        timeout=callback.timeout_seconds,
+    delivery = post_json_callback(
+        {
+            "url": callback.url,
+            "headers": callback.headers,
+            "timeoutSeconds": callback.timeout_seconds,
+        },
+        payload,
+        operation="analysis artifact",
+        post=requests.post,
     )
-    if not 200 <= response.status_code < 300:
-        raise RuntimeError(f"analysis artifact callback failed status={response.status_code} body={response.text[:4096]}")
-    return {"url": callback.url, "statusCode": response.status_code, "deliveredAt": utc_now()}
+    if delivery is not None:
+        delivery.pop("attempts", None)
+        delivery["deliveredAt"] = utc_now()
+    return delivery
 
 
 def _deliver_callback(
@@ -984,7 +996,7 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
     )
     if claimed.get("state") == "SUCCESS":
         try:
-            manifest = load_analysis_artifact_manifest(data_root, request.user_id, request.artifact_id)
+            manifest = load_analysis_artifact_manifest(data_root, request.user_id, request.analysis_artifact_id)
             _deliver_callback(data_root, request, _callback_payload(request, READY, manifest))
         except Exception:
             pass
@@ -1018,28 +1030,28 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
             "jobId": request.job_id,
             "jobType": ANALYSIS_ARTIFACT,
             "requestId": request.request_id,
-            "artifactId": request.artifact_id,
+            "analysisArtifactId": request.analysis_artifact_id,
             "analysisId": request.analysis_id,
             "userId": request.user_id,
             "name": request.name,
             "format": request.format.value,
             "status": READY,
             "fileName": file_name,
-            "relativePath": artifact_relative_path(request.user_id, request.artifact_id, file_name),
+            "relativePath": artifact_relative_path(request.user_id, request.analysis_artifact_id, file_name),
             "contentType": _content_type(request.format),
             "sizeBytes": output.stat().st_size,
-            "checksumSha256": file_sha256(output),
+            "sha256Checksum": file_sha256(output),
             "sourceVersion": source_version,
             "chartCount": len(rendered),
             **render_meta,
             "createdAt": utc_now(),
         }
         _atomic_json(staging_root / "meta" / "manifest.json", manifest)
-        final_root = artifact_root(data_root, request.user_id, request.artifact_id)
-        with _artifact_lock(data_root, request.user_id, request.artifact_id):
+        final_root = artifact_root(data_root, request.user_id, request.analysis_artifact_id)
+        with _artifact_lock(data_root, request.user_id, request.analysis_artifact_id):
             _check_cancelled(data_root, request, event)
             if final_root.exists():
-                existing = load_analysis_artifact_manifest(data_root, request.user_id, request.artifact_id)
+                existing = load_analysis_artifact_manifest(data_root, request.user_id, request.analysis_artifact_id)
                 if existing.get("jobId") != request.job_id:
                     raise FileExistsError("analysis artifact target already exists")
                 manifest = existing
@@ -1057,7 +1069,7 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
                 "relativePath": manifest["relativePath"],
                 "contentType": manifest["contentType"],
                 "sizeBytes": manifest["sizeBytes"],
-                "checksumSha256": manifest["checksumSha256"],
+                "sha256Checksum": manifest["sha256Checksum"],
                 "sourceVersion": manifest["sourceVersion"],
                 "chartCount": manifest["chartCount"],
                 "renderWarnings": manifest.get("renderWarnings") or [],
@@ -1076,7 +1088,7 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
         _deliver_callback(data_root, request, _callback_payload(request, "CANCELLED", exc=exc))
     except Exception as exc:
         shutil.rmtree(staging_root, ignore_errors=True)
-        if _tombstone_path(data_root, request.user_id, request.artifact_id).exists():
+        if _tombstone_path(data_root, request.user_id, request.analysis_artifact_id).exists():
             cancelled = ArtifactCancelled("Analysis artifact generation was cancelled by deletion.")
             update_job(
                 data_root,
@@ -1096,66 +1108,66 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
             _active_cancellations.pop(request.job_id, None)
 
 
-def load_analysis_artifact_manifest(data_root: str | Path, user_id: str, artifact_id: str) -> dict:
+def load_analysis_artifact_manifest(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> dict:
     user_id = _identity_segment(user_id, "userId")
-    artifact_id = _identity_segment(artifact_id, "artifactId")
-    path = artifact_manifest_path(data_root, user_id, artifact_id)
+    analysis_artifact_id = _identity_segment(analysis_artifact_id, "analysisArtifactId")
+    path = artifact_manifest_path(data_root, user_id, analysis_artifact_id)
     if not path.exists():
-        raise FileNotFoundError(f"analysis artifact not found: {artifact_id}")
+        raise FileNotFoundError(f"analysis artifact not found: {analysis_artifact_id}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("userId") != user_id or manifest.get("artifactId") != artifact_id:
+    if manifest.get("userId") != user_id or manifest.get("analysisArtifactId") != analysis_artifact_id:
         raise ValueError("analysis artifact manifest identity mismatch")
     if manifest.get("status") != READY:
         raise ValueError("analysis artifact is not READY")
     return manifest
 
 
-def analysis_artifact_download(data_root: str | Path, user_id: str, artifact_id: str) -> tuple[Path, dict]:
-    manifest = load_analysis_artifact_manifest(data_root, user_id, artifact_id)
+def analysis_artifact_download(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> tuple[Path, dict]:
+    manifest = load_analysis_artifact_manifest(data_root, user_id, analysis_artifact_id)
     root = Path(data_root).expanduser().resolve()
     relative = Path(str(manifest.get("relativePath") or ""))
     if relative.is_absolute():
         raise ValueError("analysis artifact path must be relative")
     output = (root / relative).resolve()
-    expected = artifact_root(data_root, user_id, artifact_id).resolve() / "files" / str(manifest.get("fileName") or "")
+    expected = artifact_root(data_root, user_id, analysis_artifact_id).resolve() / "files" / str(manifest.get("fileName") or "")
     if output != expected.resolve() or not output.is_relative_to(root):
         raise ValueError("analysis artifact path does not match its canonical identity")
     if not output.is_file():
         raise FileNotFoundError("analysis artifact file is missing")
     if output.stat().st_size != int(manifest.get("sizeBytes") or -1):
         raise ValueError("analysis artifact size does not match its manifest")
-    if file_sha256(output) != manifest.get("checksumSha256"):
+    if file_sha256(output) != manifest.get("sha256Checksum"):
         raise ValueError("analysis artifact checksum does not match its manifest")
     return output, manifest
 
 
-def delete_analysis_artifact(data_root: str | Path, user_id: str, artifact_id: str) -> dict:
+def delete_analysis_artifact(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> dict:
     user_id = _identity_segment(user_id, "userId")
-    artifact_id = _identity_segment(artifact_id, "artifactId")
+    analysis_artifact_id = _identity_segment(analysis_artifact_id, "analysisArtifactId")
     job_id: str | None = None
-    with _artifact_lock(data_root, user_id, artifact_id):
-        tombstone_path = _tombstone_path(data_root, user_id, artifact_id)
+    with _artifact_lock(data_root, user_id, analysis_artifact_id):
+        tombstone_path = _tombstone_path(data_root, user_id, analysis_artifact_id)
         existing_tombstone = (
             json.loads(tombstone_path.read_text(encoding="utf-8"))
             if tombstone_path.exists()
             else {}
         )
         job_id = existing_tombstone.get("jobId")
-        reservation_path = _reservation_path(data_root, user_id, artifact_id)
+        reservation_path = _reservation_path(data_root, user_id, analysis_artifact_id)
         if reservation_path.exists():
             reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
             job_id = reservation.get("jobId")
-        manifest_path = artifact_manifest_path(data_root, user_id, artifact_id)
+        manifest_path = artifact_manifest_path(data_root, user_id, analysis_artifact_id)
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("userId") != user_id or manifest.get("artifactId") != artifact_id:
+            if manifest.get("userId") != user_id or manifest.get("analysisArtifactId") != analysis_artifact_id:
                 raise ValueError("analysis artifact manifest identity mismatch")
             job_id = job_id or manifest.get("jobId")
         _atomic_json(
             tombstone_path,
             {
                 "userId": user_id,
-                "artifactId": artifact_id,
+                "analysisArtifactId": analysis_artifact_id,
                 "jobId": job_id,
                 "deletedAt": existing_tombstone.get("deletedAt") or utc_now(),
             },
@@ -1173,8 +1185,8 @@ def delete_analysis_artifact(data_root: str | Path, user_id: str, artifact_id: s
                 )
             except FileNotFoundError:
                 pass
-        shutil.rmtree(artifact_root(data_root, user_id, artifact_id), ignore_errors=True)
+        shutil.rmtree(artifact_root(data_root, user_id, analysis_artifact_id), ignore_errors=True)
         if job_id:
             shutil.rmtree(artifacts_root(data_root) / "_staging" / str(job_id), ignore_errors=True)
         reservation_path.unlink(missing_ok=True)
-    return {"userId": user_id, "artifactId": artifact_id, "jobId": job_id, "state": "DELETED"}
+    return {"userId": user_id, "analysisArtifactId": analysis_artifact_id, "jobId": job_id, "state": "DELETED"}

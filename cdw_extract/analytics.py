@@ -48,14 +48,14 @@ def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRe
         "userDatasetFileId": request.source.user_dataset_file_id,
         "metadataId": request.source.metadata_id,
         "metadataTableId": request.source.metadata_table_id,
-        "checksumSha256": manifest.get("checksumSha256") or manifest.get("checksum"),
+        "sha256Checksum": manifest.get("sha256Checksum"),
         "jobId": manifest.get("jobId"),
         "requestId": manifest.get("requestId"),
         "createdAt": manifest.get("createdAt"),
         "completedAt": manifest.get("completedAt"),
         "path": manifest.get("path"),
     }
-    if not material["checksumSha256"]:
+    if not material["sha256Checksum"]:
         stat = source_path.stat()
         material["sizeBytes"] = stat.st_size
         material["modifiedNs"] = stat.st_mtime_ns
