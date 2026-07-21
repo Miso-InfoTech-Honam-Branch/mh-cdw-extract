@@ -169,6 +169,7 @@ def execute_extract(
     staged_output.parent.mkdir(parents=True, exist_ok=True)
     staged_output.unlink(missing_ok=True)
     conn = None
+    compiled = None
     try:
         if cancellation is not None:
             cancellation.raise_if_requested()
@@ -212,6 +213,13 @@ def execute_extract(
 
         row_count = parquet_row_count(staged_output, connection=conn)
         columns = parquet_columns(staged_output, connection=conn)
+        if compiled is not None:
+            for index,column in enumerate(columns):
+                if index >= len(compiled.output_schema):
+                    break
+                output_column=compiled.output_schema[index]
+                column["originalName"]=column.get("originalName") or column.get("name")
+                column["name"]=output_column.label
         if cancellation is not None:
             cancellation.raise_if_requested()
         manifest = publish_dataset_file_artifact(

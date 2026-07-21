@@ -191,7 +191,7 @@ class AsyncExtractTest(unittest.TestCase):
                 }]}), encoding="utf-8"
             )
             request = {
-                **extract_request(), "tableName": "sales",
+                **extract_result_request(), "tableName": "sales",
                 "columns": [{"name": "city", "alias": "city"}, {"name": "amount", "alias": "amount"}],
                 "sourceColumns": [
                     {"columnId": "src:city", "physicalName": "city", "label": "지역", "dataType": "STRING"},
@@ -208,7 +208,8 @@ class AsyncExtractTest(unittest.TestCase):
                 ]}
             }
             accepted = extract_module.prepare_extract_job("connection-1", request, data_root)
-            extract_module.run_extract_job("connection-1", request, data_root, accepted["jobId"])
+            with patch.object(extract_module,"post_callback",return_value={"url":"callback","statusCode":200}):
+                extract_module.run_extract_job("connection-1", request, data_root, accepted["jobId"])
             job = load_job(data_root, accepted["jobId"])
             self.assertEqual("COMPLETED", job["state"])
             self.assertEqual(1, job["rowCount"])
@@ -220,6 +221,8 @@ class AsyncExtractTest(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual((" Seoul ", 100, "Seoul"), result)
+            self.assertEqual(["지역","금액","지역"],[column["name"] for column in job["resultColumns"]])
+            self.assertEqual("city",job["resultColumns"][0]["originalName"])
             self.assertEqual([], list(Path(job["filePath"]).parent.glob("*.tmp")))
 
     def test_runner_publishes_reusable_user_dataset_and_sends_exact_callback(self):
