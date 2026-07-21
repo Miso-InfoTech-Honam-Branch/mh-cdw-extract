@@ -101,6 +101,24 @@ class TransformCompilerTest(unittest.TestCase):
         self.assertTrue(compiled.output_schema[1].physical_name.startswith("p_"))
         self.assertEqual(["내과"],compiled.parameters)
 
+    def test_pivot_rejects_sum_for_a_text_column_before_execution(self):
+        pipeline={"pipelineVersion":1,"steps":[
+            {"stepId":"pivot","type":"PIVOT","config":{"groupColumnIds":[],"pivotColumnId":"src:department","values":[{"valueId":"a","value":"A","label":"A"}],"aggregates":[{"aggregateId":"patients","op":"SUM","columnId":"src:patient","label":"합계"}]}},
+            {"stepId":"output","type":"OUTPUT","config":{}},
+        ]}
+        with self.assertRaisesRegex(ValueError,"PIVOT_NUMERIC_AGGREGATE_REQUIRED"):
+            compile_pipeline("SELECT * FROM source",SOURCE,pipeline)
+
+    def test_pivot_places_values_in_columns_per_row_group(self):
+        pipeline={"pipelineVersion":1,"steps":[
+            {"stepId":"pivot","type":"PIVOT","config":{"groupColumnIds":["src:patient"],"pivotColumnId":"src:department","values":[{"valueId":"out","value":"외래","label":"외래"},{"valueId":"in","value":"입원","label":"입원"}],"aggregates":[{"aggregateId":"amount","op":"FIRST","columnId":"src:amount","label":"값"}]}},
+            {"stepId":"output","type":"OUTPUT","config":{}},
+        ]}
+        source="SELECT * FROM (VALUES ('외래', 10, 'p1'), ('입원', 20, 'p1'), ('외래', 30, 'p2')) t(department, amount, patient_id)"
+        compiled=compile_pipeline(source,SOURCE,pipeline)
+        rows=duckdb.connect().execute(compiled.sql,compiled.parameters).fetchall()
+        self.assertEqual([('p1',10,20),('p2',30,None)],sorted(rows))
+
     def test_output_is_required(self):
         with self.assertRaisesRegex(ValueError,"final active step"):
             compile_pipeline("SELECT * FROM source",SOURCE,{"steps":[]})

@@ -402,8 +402,11 @@ class PipelineCompiler:
                 else:
                     self.parameters.append(value.get("value")); condition=f"{quote_ident(pivot.physical_name)} = ?"
                 input_expr=quote_ident(source.physical_name) if source else "1"
+                if op in {"SUM","AVG","MEDIAN"} and source and not (source.data_type=="INT64" or source.data_type.startswith("DECIMAL")):
+                    raise ValueError(f"PIVOT_NUMERIC_AGGREGATE_REQUIRED: {op} 계산은 숫자 항목에서만 사용할 수 있습니다.")
                 if op in {"COUNT","COUNT_ROWS"}: expr=f"count(CASE WHEN {condition} THEN {input_expr} END)"; typ="INT64"; nullable=False
                 elif op=="COUNT_DISTINCT": expr=f"count(DISTINCT CASE WHEN {condition} THEN {input_expr} END)"; typ="INT64"; nullable=False
+                elif op in {"FIRST","LAST"} and source: expr=f"{op.lower()}({input_expr}) FILTER (WHERE {condition})"; typ=source.data_type; nullable=True
                 elif op in {"SUM","AVG","MIN","MAX","MEDIAN"} and source: expr=f"{op.lower()}(CASE WHEN {condition} THEN {input_expr} END)"; typ=source.data_type; nullable=True
                 else: raise ValueError(f"unsupported pivot aggregate: {op}")
                 output_id=f"{value.get('valueId')}:{agg.get('aggregateId')}"; output=derived_column(step_id,output_id,f"{value.get('label')} {agg.get('label')}",typ,[pivot]+([source] if source else []),"PIVOT",pivot=True,nullable=nullable)
