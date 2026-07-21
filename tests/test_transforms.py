@@ -44,6 +44,79 @@ class TransformCompilerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"final active step"):
             compile_pipeline("SELECT * FROM source",SOURCE,{"steps":[]})
 
+    def test_cast_parses_compact_date_and_timestamp_formats(self):
+        cases = [
+            ("20140522", "DATE", "YYYYMMDD", "2014-05-22"),
+            ("20140522153045", "TIMESTAMP", "YYYYMMDDHH24MISS", "2014-05-22 15:30:45"),
+        ]
+        for raw_value, target_type, input_format, expected in cases:
+            with self.subTest(target_type=target_type, input_format=input_format):
+                compiled = compile_pipeline(
+                    f"SELECT '{raw_value}' AS department, 1 AS amount, 'p1' AS patient_id",
+                    SOURCE,
+                    {"steps": [
+                        {"stepId": "cast", "type": "CAST", "config": {
+                            "columnId": "src:department", "targetType": target_type,
+                            "inputFormat": input_format, "onError": "NULL"
+                        }},
+                        {"stepId": "output", "type": "OUTPUT", "config": {}},
+                    ]},
+                )
+                value = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()[-1]
+                self.assertEqual(expected, str(value))
+
+    def test_cast_rejects_unknown_date_format(self):
+        with self.assertRaisesRegex(ValueError, "unsupported CAST inputFormat"):
+            compile_pipeline("SELECT * FROM source", SOURCE, {"steps": [
+                {"stepId": "cast", "type": "CAST", "config": {
+                    "columnId": "src:department", "targetType": "DATE", "inputFormat": "FREE_TEXT"
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]})
+
+    def test_split_column_supports_fixed_lengths(self):
+        compiled = compile_pipeline(
+            "SELECT '20140522' AS department, 1 AS amount, 'p1' AS patient_id",
+            SOURCE,
+            {"steps": [
+                {"stepId": "split", "type": "SPLIT_COLUMN", "config": {
+                    "inputColumnId": "src:department", "mode": "FIXED_LENGTH", "lengths": [4, 2, 2],
+                    "outputs": [
+                        {"outputId": "year", "label": "진료연도"},
+                        {"outputId": "month", "label": "진료월"},
+                        {"outputId": "day", "label": "진료일"},
+                    ],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+        row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
+        self.assertEqual(("2014", "05", "22"), row[-3:])
+
+    def test_split_column_rejects_mismatched_fixed_lengths(self):
+        with self.assertRaisesRegex(ValueError, "fixed lengths must match outputs"):
+            compile_pipeline("SELECT * FROM source", SOURCE, {"steps": [
+                {"stepId": "split", "type": "SPLIT_COLUMN", "config": {
+                    "inputColumnId": "src:department", "mode": "FIXED_LENGTH", "lengths": [4, 2],
+                    "outputs": [{"outputId": "year"}, {"outputId": "month"}, {"outputId": "day"}],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]})
+
+    def test_split_column_can_extract_one_slice_per_step(self):
+        compiled = compile_pipeline(
+            "SELECT '20140522' AS department, 1 AS amount, 'p1' AS patient_id",
+            SOURCE,
+            {"steps": [
+                {"stepId": "year", "type": "SPLIT_COLUMN", "config": {"inputColumnId": "src:department", "mode": "SLICE", "startAt": 1, "length": 4, "outputs": [{"outputId": "year", "label": "진료연도"}]}},
+                {"stepId": "month", "type": "SPLIT_COLUMN", "config": {"inputColumnId": "src:department", "mode": "SLICE", "startAt": 5, "length": 2, "outputs": [{"outputId": "month", "label": "진료월"}]}},
+                {"stepId": "day", "type": "SPLIT_COLUMN", "config": {"inputColumnId": "src:department", "mode": "SLICE", "startAt": 7, "length": 2, "outputs": [{"outputId": "day", "label": "진료일"}]}},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+        row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
+        self.assertEqual(("2014", "05", "22"), row[-3:])
+
     def test_each_supported_transform_compiles_to_executable_duckdb_sql(self):
         source = "SELECT * FROM (VALUES (' A ',10,'x'),(NULL,20,'y'),('B',10,'x')) t(department,amount,patient_id)"
         cases = {

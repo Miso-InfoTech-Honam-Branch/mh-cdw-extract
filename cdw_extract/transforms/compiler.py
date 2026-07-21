@@ -176,7 +176,24 @@ class PipelineCompiler:
         source = self.column(config.get("columnId")); target = normalize_type(config.get("targetType")); output_id = config.get("outputId") or "cast"
         duck_type = target.replace("STRING", "VARCHAR").replace("INT64", "BIGINT").replace("TIMESTAMP_TZ", "TIMESTAMPTZ").replace("BINARY", "BLOB")
         policy = str(config.get("onError") or "FAIL").upper()
-        cast = f"CAST({quote_ident(source.physical_name)} AS {duck_type})" if policy == "FAIL" else f"TRY_CAST({quote_ident(source.physical_name)} AS {duck_type})"
+        input_format = str(config.get("inputFormat") or "").upper()
+        date_formats = {
+            "YYYYMMDD": "%Y%m%d",
+            "YYMMDD": "%y%m%d",
+            "YYYY-MM-DD": "%Y-%m-%d",
+            "YYYY/MM/DD": "%Y/%m/%d",
+            "YYYYMMDDHH24MISS": "%Y%m%d%H%M%S",
+            "YYYY-MM-DD HH24:MI:SS": "%Y-%m-%d %H:%M:%S",
+            "ISO8601_TZ": "%Y-%m-%dT%H:%M:%S%z",
+        }
+        if input_format and target in {"DATE", "TIMESTAMP", "TIMESTAMP_TZ"}:
+            if input_format not in date_formats:
+                raise ValueError(f"unsupported CAST inputFormat: {input_format}")
+            parser = "strptime" if policy == "FAIL" else "try_strptime"
+            parsed = f"{parser}(CAST({quote_ident(source.physical_name)} AS VARCHAR), '{date_formats[input_format]}')"
+            cast = f"CAST({parsed} AS {duck_type})"
+        else:
+            cast = f"CAST({quote_ident(source.physical_name)} AS {duck_type})" if policy == "FAIL" else f"TRY_CAST({quote_ident(source.physical_name)} AS {duck_type})"
         output = derived_column(step_id, output_id, config.get("label") or source.label, target, [source], "CAST", nullable=source.nullable or policy != "FAIL")
         select = self.passthrough() if config.get("keepInput", False) else [quote_ident(item.physical_name) for item in self.schema if item.column_id != source.column_id]
         schema = list(self.schema) if config.get("keepInput", False) else [item for item in self.schema if item.column_id != source.column_id]
@@ -222,8 +239,10 @@ class PipelineCompiler:
 
     def step_split_column(self, step_id: str, config: dict) -> None:
         source=self.column(config.get("inputColumnId")); outputs=config.get("outputs") or []
-        if source.data_type!="STRING" or len(outputs)<2 or len(outputs)>20: raise ValueError("SPLIT_COLUMN requires STRING and 2-20 outputs")
-        mode=str(config.get("mode") or "DELIMITER").upper(); selects=self.passthrough(); schema=list(self.schema)
+        mode=str(config.get("mode") or "DELIMITER").upper()
+        minimum_outputs=1 if mode=="SLICE" else 2
+        if source.data_type!="STRING" or len(outputs)<minimum_outputs or len(outputs)>20: raise ValueError(f"SPLIT_COLUMN requires STRING and {minimum_outputs}-20 outputs")
+        selects=self.passthrough(); schema=list(self.schema)
         if mode=="DELIMITER":
             for index,item in enumerate(outputs,1):
                 self.parameters.append(str(config.get("delimiter") or ""))
@@ -237,6 +256,21 @@ class PipelineCompiler:
                 output=derived_column(step_id,item.get("outputId") or f"part-{index+1}",item.get("label") or f"나눈 값 {index+1}","STRING",[source],"SPLIT_COLUMN")
                 expr=f"substr({quote_ident(source.physical_name)}, {starts[index]})" if ends[index] is None else f"substr({quote_ident(source.physical_name)}, {starts[index]}, {ends[index]-starts[index]+1})"
                 selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output)
+        elif mode=="FIXED_LENGTH":
+            lengths=[int(value) for value in config.get("lengths") or []]
+            if len(lengths)!=len(outputs) or any(value<1 for value in lengths): raise ValueError("SPLIT_COLUMN fixed lengths must match outputs and be positive")
+            start=1
+            for index,(item,length) in enumerate(zip(outputs,lengths),1):
+                output=derived_column(step_id,item.get("outputId") or f"part-{index}",item.get("label") or f"나눈 값 {index}","STRING",[source],"SPLIT_COLUMN")
+                expr=f"substr({quote_ident(source.physical_name)}, {start}, {length})"
+                selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output); start+=length
+        elif mode=="SLICE":
+            start=int(config.get("startAt") or 0); length=int(config.get("length") or 0)
+            if start<1 or length<1 or len(outputs)!=1: raise ValueError("SPLIT_COLUMN slice requires one output, positive startAt and length")
+            item=outputs[0]
+            output=derived_column(step_id,item.get("outputId") or "slice",item.get("label") or "추출한 값","STRING",[source],"SPLIT_COLUMN")
+            expr=f"substr({quote_ident(source.physical_name)}, {start}, {length})"
+            selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output)
         else: raise ValueError("unsupported SPLIT_COLUMN mode")
         self.output(step_id,selects,schema,len(self.warnings))
 
