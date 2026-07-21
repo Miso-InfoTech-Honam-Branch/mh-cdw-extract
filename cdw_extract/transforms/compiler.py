@@ -241,7 +241,8 @@ class PipelineCompiler:
         source=self.column(config.get("inputColumnId")); outputs=config.get("outputs") or []
         mode=str(config.get("mode") or "DELIMITER").upper()
         minimum_outputs=1 if mode=="SLICE" else 2
-        if source.data_type!="STRING" or len(outputs)<minimum_outputs or len(outputs)>20: raise ValueError(f"SPLIT_COLUMN requires STRING and {minimum_outputs}-20 outputs")
+        if source.data_type!="STRING": raise ValueError("SPLIT_COLUMN requires a STRING input column")
+        if len(outputs)<minimum_outputs or len(outputs)>20: raise ValueError(f"SPLIT_COLUMN {mode} requires {minimum_outputs}-20 output definitions")
         selects=self.passthrough(); schema=list(self.schema)
         if mode=="DELIMITER":
             for index,item in enumerate(outputs,1):
