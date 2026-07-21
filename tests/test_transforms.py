@@ -3,8 +3,9 @@ from __future__ import annotations
 import unittest
 import duckdb
 
-from cdw_extract.transforms.compiler import compile_pipeline
-from cdw_extract.transforms.schema import ColumnSchema, common_type, normalize_type
+from cdw_extract.transforms.compiler import canonical_hash, compile_pipeline
+from cdw_extract.transforms.runtime import _resolve_automatic_pivot_values
+from cdw_extract.transforms.schema import ColumnSchema, common_type, normalize_type, numeric_result_type
 
 
 SOURCE = [
@@ -15,11 +16,30 @@ SOURCE = [
 
 
 class TransformCompilerTest(unittest.TestCase):
+    def test_empty_pivot_values_are_discovered_from_all_rows(self):
+        pipeline={"pipelineVersion":1,"steps":[
+            {"stepId":"pivot","type":"PIVOT","config":{"groupColumnIds":[],"pivotColumnId":"src:department","values":[],"aggregates":[{"aggregateId":"amount","op":"SUM","columnId":"src:amount","label":"합계"}]}},
+            {"stepId":"output","type":"OUTPUT","config":{}},
+        ]}
+        connection=duckdb.connect()
+        resolved,declarative_hash=_resolve_automatic_pivot_values(
+            connection,
+            "(VALUES ('외래', 10, 'p1'), ('입원', 20, 'p2'), ('외래', 30, 'p3')) AS t(department, amount, patient_id)",
+            SOURCE,
+            pipeline,
+        )
+        values=resolved["steps"][0]["config"]["values"]
+        self.assertEqual(["외래","입원"],sorted(item["value"] for item in values))
+        self.assertEqual(2,len({item["valueId"] for item in values}))
+        self.assertEqual(declarative_hash,canonical_hash(pipeline))
+
     def test_type_normalization_and_numeric_promotion(self):
         self.assertEqual("STRING", normalize_type("varchar"))
         self.assertEqual("TIMESTAMP_TZ", normalize_type("timestamp with time zone"))
         self.assertEqual("DECIMAL(21,2)", common_type(["INT64", "DECIMAL(12,2)"]))
         self.assertEqual("INT64", common_type(["NULL", "INT64"]))
+        self.assertEqual(("DECIMAL(13,2)", None), numeric_result_type("DECIMAL(12,2)", "DECIMAL(8,1)", "ADD"))
+        self.assertEqual(("DECIMAL(38,19)", "DECIMAL_SCALE_REDUCED"), numeric_result_type("INT64", "INT64", "DIVIDE"))
 
     def test_negative_filter_includes_null_and_values_are_parameters(self):
         pipeline={"pipelineVersion":1,"steps":[
@@ -29,6 +49,47 @@ class TransformCompilerTest(unittest.TestCase):
         compiled=compile_pipeline("SELECT * FROM source",SOURCE,pipeline)
         self.assertIn('"amount" <> CAST(? AS DECIMAL(12,2)) OR "amount" IS NULL',compiled.sql)
         self.assertEqual([100],compiled.parameters)
+
+    def test_filter_honors_each_condition_connector_in_order(self):
+        pipeline={"pipelineVersion":1,"steps":[
+            {"stepId":"filter","type":"FILTER","config":{"logic":"AND","conditions":[
+                {"columnId":"src:department","operator":"EQ","values":["A"]},
+                {"columnId":"src:amount","operator":"GTE","values":[100],"logic":"OR"},
+                {"columnId":"src:patient","operator":"IS_NOT_NULL","values":[],"logic":"AND"},
+            ]}},
+            {"stepId":"output","type":"OUTPUT","config":{}},
+        ]}
+        compiled=compile_pipeline("SELECT * FROM source",SOURCE,pipeline)
+        self.assertIn('(("department" = CAST(? AS VARCHAR) OR "amount" >= CAST(? AS DECIMAL(12,2))) AND "patient_id" IS NOT NULL)',compiled.sql)
+        self.assertEqual(["A",100],compiled.parameters)
+
+    def test_replace_value_can_replace_the_whole_value_when_text_is_contained(self):
+        compiled = compile_pipeline(
+            "SELECT 'A01DAST' AS department, 1 AS amount, 'p1' AS patient_id",
+            SOURCE,
+            {"steps": [
+                {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "src:department", "matchMode": "CONTAINS",
+                    "mappings": [{"from": "A01", "to": "분류 A"}],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+        row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
+        self.assertEqual("A01DAST", row[0])
+        self.assertEqual("분류 A", row[-1])
+
+    def test_key_based_deduplicate_keeps_one_row_without_an_order_choice(self):
+        compiled = compile_pipeline(
+            "SELECT * FROM (VALUES ('A', 10, 'first'), ('A', 20, 'second')) t(department, amount, patient_id)",
+            SOURCE,
+            {"steps": [
+                {"stepId": "deduplicate", "type": "DEDUPLICATE", "config": {"keyColumnIds": ["src:department"]}},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+        rows = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchall()
+        self.assertEqual(1, len(rows))
 
     def test_group_and_fixed_pivot_have_stable_schema(self):
         pipeline={"pipelineVersion":1,"steps":[

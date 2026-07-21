@@ -318,6 +318,8 @@ def callback_payload(job: dict) -> dict:
         "resultUserDatasetId": job.get("resultUserDatasetId"),
         "resultUserDatasetFileId": job.get("resultUserDatasetFileId"),
         "resultColumns": job.get("resultColumns") or [],
+        "resultManifestPath": job.get("manifestPath") or (job.get("artifact") or {}).get("manifestPath"),
+        "resultSha256": (job.get("artifact") or {}).get("sha256Checksum"),
         "artifact": job.get("artifact"),
     }
 

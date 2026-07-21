@@ -93,6 +93,35 @@ def common_type(values: list[str], explicit: str | None = None) -> str:
     raise ValueError(f"columns do not have a safe common type: {', '.join(sorted(types))}")
 
 
+def numeric_result_type(left: str, right: str, operator: str) -> tuple[str, str | None]:
+    left_type, right_type = normalize_type(left), normalize_type(right)
+    if left_type == right_type == "INT64" and operator in {"ADD", "SUBTRACT", "MULTIPLY"}:
+        return "INT64", None
+    if left_type != "INT64" and not decimal_parts(left_type):
+        raise ValueError(f"PIPELINE_TYPE_MISMATCH: {left_type} is not numeric")
+    if right_type != "INT64" and not decimal_parts(right_type):
+        raise ValueError(f"PIPELINE_TYPE_MISMATCH: {right_type} is not numeric")
+    p1, s1 = decimal_parts(left_type) or (19, 0)
+    p2, s2 = decimal_parts(right_type) or (19, 0)
+    if operator in {"ADD", "SUBTRACT"}:
+        scale = max(s1, s2)
+        precision = max(p1 - s1, p2 - s2) + scale + 1
+    elif operator == "MULTIPLY":
+        scale, precision = s1 + s2, p1 + p2 + 1
+    elif operator == "DIVIDE":
+        scale = max(6, s1 + p2 + 1)
+        precision = p1 - s1 + s2 + scale
+    else:
+        raise ValueError(f"unsupported numeric operator: {operator}")
+    if precision <= 38:
+        return f"DECIMAL({precision},{scale})", None
+    integer_digits = precision - scale
+    if integer_digits > 38:
+        raise ValueError("PIPELINE_DECIMAL_OVERFLOW: integer digits exceed precision 38")
+    adjusted_scale = 38 - integer_digits
+    return f"DECIMAL(38,{adjusted_scale})", "DECIMAL_SCALE_REDUCED"
+
+
 def derived_column(step_id: str, output_id: str, label: str, data_type: str, sources: list[ColumnSchema], operation: str, *, pivot: bool = False, nullable: bool = True) -> ColumnSchema:
     column_id = f"{'pivot' if pivot else 'out'}:{step_id}:{output_id}"
     source_ids: list[str] = []

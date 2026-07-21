@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..duck import quote_ident
-from .schema import ColumnSchema, common_type, derived_column, normalize_type, relabel, schema_hash
+from .schema import ColumnSchema, common_type, derived_column, normalize_type, numeric_result_type, relabel, schema_hash
 
 
 MAX_STEPS = 50
@@ -165,10 +165,14 @@ class PipelineCompiler:
     def step_filter(self, step_id: str, config: dict) -> None:
         conditions = config.get("conditions") or []
         if not conditions: raise ValueError("FILTER requires conditions")
-        logic = " OR " if str(config.get("logic") or "AND").upper() == "OR" else " AND "
+        default_logic = "OR" if str(config.get("logic") or "AND").upper() == "OR" else "AND"
+        predicate = self._condition(conditions[0])
+        for condition in conditions[1:]:
+            condition_logic = "OR" if str(condition.get("logic") or default_logic).upper() == "OR" else "AND"
+            predicate = f"({predicate} {condition_logic} {self._condition(condition)})"
         warning_start = len(self.warnings)
         relation_name = f"__step_{len(self.step_schemas):03d}"
-        self.ctes.append(f"{quote_ident(relation_name)} AS (SELECT * FROM {self.relation} WHERE {logic.join(self._condition(item) for item in conditions)})")
+        self.ctes.append(f"{quote_ident(relation_name)} AS (SELECT * FROM {self.relation} WHERE {predicate})")
         self.relation = quote_ident(relation_name)
         self.step_schemas.append({"stepId": step_id, "status": "VALID", "outputSchema": [item.json() for item in self.schema], "warnings": self.warnings[warning_start:], "_schema": list(self.schema)})
 
@@ -279,9 +283,17 @@ class PipelineCompiler:
     def step_replace_value(self, step_id: str, config: dict) -> None:
         source=self.column(config.get("columnId")); mappings=config.get("mappings") or []
         if not mappings: raise ValueError("REPLACE_VALUE requires mappings")
+        match_mode=str(config.get("matchMode") or "EXACT").upper()
+        if match_mode not in {"EXACT", "CONTAINS"}: raise ValueError("unsupported REPLACE_VALUE matchMode")
         parts=[]
         for item in mappings:
-            self.parameters.extend([item.get("from"),item.get("to")]); parts.append(f"WHEN {quote_ident(source.physical_name)} = ? THEN ?")
+            source_value=item.get("from")
+            if match_mode == "CONTAINS":
+                escaped=str(source_value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                self.parameters.extend([f"%{escaped}%",item.get("to")])
+                parts.append(f"WHEN CAST({quote_ident(source.physical_name)} AS VARCHAR) LIKE ? ESCAPE '\\' THEN ?")
+            else:
+                self.parameters.extend([source_value,item.get("to")]); parts.append(f"WHEN {quote_ident(source.physical_name)} = ? THEN ?")
         unmatched=str(config.get("unmatchedPolicy") or "KEEP").upper()
         otherwise="NULL" if unmatched=="NULL" else quote_ident(source.physical_name)
         output=derived_column(step_id,config.get("outputId") or "replaced",config.get("label") or source.label,source.data_type,[source],"REPLACE_VALUE")
@@ -297,7 +309,10 @@ class PipelineCompiler:
             return "?",[],normalize_type(node.get("dataType") or ("NULL" if value is None else "STRING"))
         args=[self._calc(item,depth+1) for item in node.get("args") or []]; sql=[item[0] for item in args]; sources=[col for item in args for col in item[1]]
         if op in {"ADD","SUBTRACT","MULTIPLY","DIVIDE"} and len(sql)==2:
-            symbol={"ADD":"+","SUBTRACT":"-","MULTIPLY":"*","DIVIDE":"/"}[op]; typ=common_type([item[2] for item in args]); return f"({sql[0]} {symbol} {sql[1]})",sources,typ
+            symbol={"ADD":"+","SUBTRACT":"-","MULTIPLY":"*","DIVIDE":"/"}[op]
+            typ, warning = numeric_result_type(args[0][2], args[1][2], op)
+            if warning: self.warnings.append({"code":warning,"message":"정수부를 보존하기 위해 소수 자릿수를 줄였습니다."})
+            return f"({sql[0]} {symbol} {sql[1]})",sources,typ
         if op=="COALESCE" and sql: return f"COALESCE({', '.join(sql)})",sources,common_type([item[2] for item in args])
         if op=="CONCAT" and sql: return f"concat({', '.join('CAST('+item+' AS VARCHAR)' for item in sql)})",sources,"STRING"
         raise ValueError(f"unsupported calculation op: {op}")
@@ -372,12 +387,21 @@ class PipelineCompiler:
     def step_pivot(self, step_id: str, config: dict) -> None:
         groups=[self.column(item) for item in config.get("groupColumnIds") or []]; pivot=self.column(config.get("pivotColumnId")); values=config.get("values") or []; aggs=config.get("aggregates") or []
         if not values or len(values)>MAX_PIVOT_VALUES: raise ValueError("PIVOT_VALUES_REQUIRED")
+        unknown_policy=str(config.get("unknownValuePolicy") or "IGNORE").upper()
+        if unknown_policy not in {"IGNORE","FAIL","OTHER"}: raise ValueError("PIVOT_UNKNOWN_VALUE_POLICY")
+        if unknown_policy=="OTHER" and not any(str(item.get("valueId"))=="__other__" for item in values): raise ValueError("PIVOT_OTHER_VALUE_REQUIRED")
         if len(values)*len(aggs)>MAX_PIVOT_COLUMNS: raise ValueError("PIPELINE_SCHEMA_TOO_WIDE")
         selects=[quote_ident(item.physical_name) for item in groups]; schema=list(groups)
         for value in values:
             for agg in aggs:
-                op=str(agg.get("op") or "").upper(); source=self.column(agg.get("columnId")) if agg.get("columnId") else None; self.parameters.append(value.get("value"))
-                condition=f"{quote_ident(pivot.physical_name)} = ?"; input_expr=quote_ident(source.physical_name) if source else "1"
+                op=str(agg.get("op") or "").upper(); source=self.column(agg.get("columnId")) if agg.get("columnId") else None
+                if str(value.get("valueId"))=="__other__":
+                    known=[item.get("value") for item in values if str(item.get("valueId"))!="__other__"]
+                    self.parameters.extend(known)
+                    condition=f"{quote_ident(pivot.physical_name)} NOT IN ({', '.join('?' for _ in known)})" if known else "TRUE"
+                else:
+                    self.parameters.append(value.get("value")); condition=f"{quote_ident(pivot.physical_name)} = ?"
+                input_expr=quote_ident(source.physical_name) if source else "1"
                 if op in {"COUNT","COUNT_ROWS"}: expr=f"count(CASE WHEN {condition} THEN {input_expr} END)"; typ="INT64"; nullable=False
                 elif op=="COUNT_DISTINCT": expr=f"count(DISTINCT CASE WHEN {condition} THEN {input_expr} END)"; typ="INT64"; nullable=False
                 elif op in {"SUM","AVG","MIN","MAX","MEDIAN"} and source: expr=f"{op.lower()}(CASE WHEN {condition} THEN {input_expr} END)"; typ=source.data_type; nullable=True
@@ -401,9 +425,10 @@ class PipelineCompiler:
             sql=f"SELECT DISTINCT * FROM {self.relation}"
         else:
             order=config.get("orderBy") or []
-            if not order: raise ValueError("key-based DEDUPLICATE requires orderBy")
-            partition=", ".join(self.expression(item) for item in keys); ordering=", ".join(f"{self.expression(item.get('columnId'))} {'DESC' if str(item.get('direction')).upper()=='DESC' else 'ASC'}" for item in order)
-            sql=f"SELECT * EXCLUDE (__dedup_rn) FROM (SELECT *, row_number() OVER (PARTITION BY {partition} ORDER BY {ordering}) __dedup_rn FROM {self.relation}) WHERE __dedup_rn=1"
+            partition=", ".join(self.expression(item) for item in keys)
+            ordering=", ".join(f"{self.expression(item.get('columnId'))} {'DESC' if str(item.get('direction')).upper()=='DESC' else 'ASC'}" for item in order)
+            order_clause=f" ORDER BY {ordering}" if ordering else ""
+            sql=f"SELECT * EXCLUDE (__dedup_rn) FROM (SELECT *, row_number() OVER (PARTITION BY {partition}{order_clause}) __dedup_rn FROM {self.relation}) WHERE __dedup_rn=1"
         relation_name=f"__step_{len(self.step_schemas):03d}"; self.ctes.append(f"{quote_ident(relation_name)} AS ({sql})"); self.relation=quote_ident(relation_name)
         self.step_schemas.append({"stepId":step_id,"status":"VALID","outputSchema":[item.json() for item in self.schema],"warnings":[],"_schema":list(self.schema)})
 
