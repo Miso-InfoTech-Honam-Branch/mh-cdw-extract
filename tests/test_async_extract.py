@@ -169,6 +169,57 @@ class AsyncExtractTest(unittest.TestCase):
             self.assertEqual("COMPLETED", job["state"])
             self.assertEqual(2, job["rowCount"])
             self.assertTrue(Path(job["filePath"]).exists())
+
+    def test_runner_applies_saved_pipeline_to_real_parquet_output(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            connection_root = Path(data_root) / "connections" / "connection-1"
+            source_file = connection_root / "tables" / "sales.parquet"
+            source_file.parent.mkdir(parents=True)
+            connection = extract_module.connect()
+            try:
+                connection.execute(
+                    "COPY (SELECT ' Seoul ' AS city, 100::BIGINT AS amount "
+                    "UNION ALL SELECT 'Busan', 50) TO ? (FORMAT PARQUET)",
+                    [source_file.as_posix()],
+                )
+            finally:
+                connection.close()
+            (connection_root / "manifest.json").write_text(
+                json.dumps({"connectionId": "connection-1", "status": "COMPLETED", "tables": [{
+                    "tableId": "table-1", "schemaName": "public", "tableName": "sales",
+                    "path": "tables/sales.parquet"
+                }]}), encoding="utf-8"
+            )
+            request = {
+                **extract_request(), "tableName": "sales",
+                "columns": [{"name": "city", "alias": "city"}, {"name": "amount", "alias": "amount"}],
+                "sourceColumns": [
+                    {"columnId": "src:city", "physicalName": "city", "label": "지역", "dataType": "STRING"},
+                    {"columnId": "src:amount", "physicalName": "amount", "label": "금액", "dataType": "INT64"},
+                ],
+                "pipeline": {"pipelineVersion": 1, "steps": [
+                    {"stepId": "trim-city", "type": "TRIM", "config": {
+                        "columnId": "src:city", "mode": "BOTH", "outputId": "city", "label": "지역"
+                    }},
+                    {"stepId": "filter-amount", "type": "FILTER", "config": {"conditions": [{
+                        "columnId": "src:amount", "operator": "GTE", "values": [100]
+                    }]}},
+                    {"stepId": "output", "type": "OUTPUT", "config": {}}
+                ]}
+            }
+            accepted = extract_module.prepare_extract_job("connection-1", request, data_root)
+            extract_module.run_extract_job("connection-1", request, data_root, accepted["jobId"])
+            job = load_job(data_root, accepted["jobId"])
+            self.assertEqual("COMPLETED", job["state"])
+            self.assertEqual(1, job["rowCount"])
+            connection = extract_module.connect()
+            try:
+                result = connection.execute(
+                    "SELECT * FROM read_parquet(?)", [job["filePath"]]
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual((" Seoul ", 100, "Seoul"), result)
             self.assertEqual([], list(Path(job["filePath"]).parent.glob("*.tmp")))
 
     def test_runner_publishes_reusable_user_dataset_and_sends_exact_callback(self):

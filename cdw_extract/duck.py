@@ -98,6 +98,8 @@ class ManagedDuckDBConnection:
             self.temp_directory.mkdir(parents=True, exist_ok=False)
             self._connection = duckdb.connect(database=":memory:")
             self._connection.execute(f"SET temp_directory={sql_literal(self.temp_directory.as_posix())}")
+            # Platform-wide temporal semantics are fixed to Korean local time.
+            self._connection.execute("SET TimeZone='Asia/Seoul'")
         except Exception:
             self._cleanup()
             raise

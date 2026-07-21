@@ -16,6 +16,7 @@ from .jobs import (
     update_job,
 )
 from .query import final_query
+from .transforms.runtime import compile_pipeline_request
 from .user_dataset import (
     dataset_file_manifest_path,
     dataset_file_parquet_path,
@@ -169,7 +170,6 @@ def execute_extract(
     staged_output.unlink(missing_ok=True)
     conn = None
     try:
-        sql = final_query(connection_id, data_root, request)
         if cancellation is not None:
             cancellation.raise_if_requested()
         conn = connect(data_root, "extract", job_id)
@@ -177,7 +177,19 @@ def execute_extract(
             cancellation.attach(conn)
             cancellation.raise_if_requested()
         copy_format = "CSV, HEADER true" if output_format == "csv" else "PARQUET"
-        conn.execute(f"COPY ({sql}) TO ? (FORMAT {copy_format})", [staged_output.as_posix()])
+        if request.get("pipeline"):
+            compiled = compile_pipeline_request(connection_id, request, data_root, conn)
+            conn.execute(
+                f"CREATE TEMP TABLE __pipeline_result AS {compiled.sql}",
+                compiled.parameters,
+            )
+            conn.execute(
+                f"COPY __pipeline_result TO ? (FORMAT {copy_format})",
+                [staged_output.as_posix()],
+            )
+        else:
+            sql = final_query(connection_id, data_root, request)
+            conn.execute(f"COPY ({sql}) TO ? (FORMAT {copy_format})", [staged_output.as_posix()])
         if cancellation is not None:
             cancellation.raise_if_requested()
 

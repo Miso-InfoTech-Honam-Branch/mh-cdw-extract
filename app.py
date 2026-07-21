@@ -42,6 +42,7 @@ from cdw_extract import (
 )
 from cdw_extract.config import data_root, load_dotenv
 from cdw_extract.user_dataset_jobs import prepare_user_dataset_convert_job, run_user_dataset_convert_job
+from cdw_extract.transforms.runtime import preview_pipeline, validate_pipeline_request
 
 load_dotenv()
 
@@ -166,6 +167,22 @@ def refresh_connection_alias(connection_id: str, background_tasks: BackgroundTas
 def preview_connection_route(connection_id: str, request: dict) -> dict:
     try:
         return preview(connection_id, request, root_path())
+    except Exception as exc:
+        raise to_http_error(exc) from exc
+
+
+@app.post("/api/v1/connections/{connection_id}/pipelines/validate")
+def validate_pipeline_route(connection_id: str, request: dict) -> dict:
+    try:
+        return validate_pipeline_request(connection_id, request, root_path())
+    except Exception as exc:
+        raise to_http_error(exc) from exc
+
+
+@app.post("/api/v1/connections/{connection_id}/pipelines/preview")
+def preview_pipeline_route(connection_id: str, request: dict) -> dict:
+    try:
+        return preview_pipeline(connection_id, request, root_path())
     except Exception as exc:
         raise to_http_error(exc) from exc
 
