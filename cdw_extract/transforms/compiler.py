@@ -409,7 +409,11 @@ class PipelineCompiler:
                 elif op in {"FIRST","LAST"} and source: expr=f"{op.lower()}({input_expr}) FILTER (WHERE {condition})"; typ=source.data_type; nullable=True
                 elif op in {"SUM","AVG","MIN","MAX","MEDIAN"} and source: expr=f"{op.lower()}(CASE WHEN {condition} THEN {input_expr} END)"; typ=source.data_type; nullable=True
                 else: raise ValueError(f"unsupported pivot aggregate: {op}")
-                output_id=f"{value.get('valueId')}:{agg.get('aggregateId')}"; output=derived_column(step_id,output_id,f"{value.get('label')} {agg.get('label')}",typ,[pivot]+([source] if source else []),"PIVOT",pivot=True,nullable=nullable)
+                output_id=f"{value.get('valueId')}:{agg.get('aggregateId')}"
+                output_label=str(value.get("label") or value.get("value"))
+                if len(aggs)>1 and agg.get("label"):
+                    output_label=f"{output_label} {agg.get('label')}"
+                output=derived_column(step_id,output_id,output_label,typ,[pivot]+([source] if source else []),"PIVOT",pivot=True,nullable=nullable)
                 selects.append(f"{expr} AS {quote_ident(output.physical_name)}"); schema.append(output)
         group_sql=f" GROUP BY {', '.join(str(i) for i in range(1,len(groups)+1))}" if groups else ""; relation_name=f"__step_{len(self.step_schemas):03d}"
         self.ctes.append(f"{quote_ident(relation_name)} AS (SELECT {', '.join(selects)} FROM {self.relation}{group_sql})"); self.relation=quote_ident(relation_name); self.schema=schema

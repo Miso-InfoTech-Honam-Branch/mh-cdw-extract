@@ -52,6 +52,12 @@ class TransformCompilerTest(unittest.TestCase):
             [{"sourceColumn":"item_cd","outputColumn":"항목코드__code_name"}],
         )
         self.assertEqual({"11":"신장","12":"체중"},{item["value"]:item["label"] for item in resolved["steps"][0]["config"]["values"]})
+        compiled=compile_pipeline(
+            "SELECT * FROM (VALUES ('11', '신장', 170), ('12', '체중', 60)) AS t(항목코드, 항목코드__code_name, 측정값)",
+            source_schema,
+            resolved,
+        )
+        self.assertEqual(["신장","체중"],[column.label for column in compiled.output_schema])
 
     def test_type_normalization_and_numeric_promotion(self):
         self.assertEqual("STRING", normalize_type("varchar"))
