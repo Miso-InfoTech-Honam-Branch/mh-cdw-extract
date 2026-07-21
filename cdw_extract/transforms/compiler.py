@@ -241,21 +241,22 @@ class PipelineCompiler:
         source=self.column(config.get("inputColumnId")); outputs=config.get("outputs") or []
         mode=str(config.get("mode") or "DELIMITER").upper()
         minimum_outputs=1 if mode=="SLICE" else 2
-        if source.data_type!="STRING": raise ValueError("SPLIT_COLUMN requires a STRING input column")
+        if source.data_type=="BINARY": raise ValueError("SPLIT_COLUMN does not support BINARY input columns")
         if len(outputs)<minimum_outputs or len(outputs)>20: raise ValueError(f"SPLIT_COLUMN {mode} requires {minimum_outputs}-20 output definitions")
+        source_expression=quote_ident(source.physical_name) if source.data_type=="STRING" else f"CAST({quote_ident(source.physical_name)} AS VARCHAR)"
         selects=self.passthrough(); schema=list(self.schema)
         if mode=="DELIMITER":
             for index,item in enumerate(outputs,1):
                 self.parameters.append(str(config.get("delimiter") or ""))
                 output=derived_column(step_id,item.get("outputId") or f"part-{index}",item.get("label") or f"나눈 값 {index}","STRING",[source],"SPLIT_COLUMN")
-                selects.append(f"NULLIF(split_part({quote_ident(source.physical_name)}, ?, {index}), '') AS {quote_ident(output.physical_name)}"); schema.append(output)
+                selects.append(f"NULLIF(split_part({source_expression}, ?, {index}), '') AS {quote_ident(output.physical_name)}"); schema.append(output)
         elif mode=="POSITION":
             positions=[int(value) for value in config.get("positions") or []]
             if len(positions)!=len(outputs)-1 or positions!=sorted(set(positions)): raise ValueError("SPLIT_COLUMN positions are invalid")
             starts=[1]+[value+1 for value in positions]; ends=positions+[None]
             for index,item in enumerate(outputs):
                 output=derived_column(step_id,item.get("outputId") or f"part-{index+1}",item.get("label") or f"나눈 값 {index+1}","STRING",[source],"SPLIT_COLUMN")
-                expr=f"substr({quote_ident(source.physical_name)}, {starts[index]})" if ends[index] is None else f"substr({quote_ident(source.physical_name)}, {starts[index]}, {ends[index]-starts[index]+1})"
+                expr=f"substr({source_expression}, {starts[index]})" if ends[index] is None else f"substr({source_expression}, {starts[index]}, {ends[index]-starts[index]+1})"
                 selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output)
         elif mode=="FIXED_LENGTH":
             lengths=[int(value) for value in config.get("lengths") or []]
@@ -263,14 +264,14 @@ class PipelineCompiler:
             start=1
             for index,(item,length) in enumerate(zip(outputs,lengths),1):
                 output=derived_column(step_id,item.get("outputId") or f"part-{index}",item.get("label") or f"나눈 값 {index}","STRING",[source],"SPLIT_COLUMN")
-                expr=f"substr({quote_ident(source.physical_name)}, {start}, {length})"
+                expr=f"substr({source_expression}, {start}, {length})"
                 selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output); start+=length
         elif mode=="SLICE":
             start=int(config.get("startAt") or 0); length=int(config.get("length") or 0)
             if start<1 or length<1 or len(outputs)!=1: raise ValueError("SPLIT_COLUMN slice requires one output, positive startAt and length")
             item=outputs[0]
             output=derived_column(step_id,item.get("outputId") or "slice",item.get("label") or "추출한 값","STRING",[source],"SPLIT_COLUMN")
-            expr=f"substr({quote_ident(source.physical_name)}, {start}, {length})"
+            expr=f"substr({source_expression}, {start}, {length})"
             selects.append(f"NULLIF({expr}, '') AS {quote_ident(output.physical_name)}"); schema.append(output)
         else: raise ValueError("unsupported SPLIT_COLUMN mode")
         self.output(step_id,selects,schema,len(self.warnings))

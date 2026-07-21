@@ -117,6 +117,22 @@ class TransformCompilerTest(unittest.TestCase):
         row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
         self.assertEqual(("2014", "05", "22"), row[-3:])
 
+    def test_split_column_casts_numeric_input_to_text_without_changing_source(self):
+        compiled = compile_pipeline(
+            "SELECT '진료' AS department, 20140522 AS amount, 'p1' AS patient_id",
+            SOURCE,
+            {"steps": [
+                {"stepId": "year", "type": "SPLIT_COLUMN", "config": {
+                    "inputColumnId": "src:amount", "mode": "SLICE", "startAt": 1, "length": 4,
+                    "outputs": [{"outputId": "year", "label": "진료연도"}],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+        row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
+        self.assertEqual(20140522, row[1])
+        self.assertEqual("2014", row[-1])
+
     def test_each_supported_transform_compiles_to_executable_duckdb_sql(self):
         source = "SELECT * FROM (VALUES (' A ',10,'x'),(NULL,20,'y'),('B',10,'x')) t(department,amount,patient_id)"
         cases = {
