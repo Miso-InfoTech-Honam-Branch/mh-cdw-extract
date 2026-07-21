@@ -23,7 +23,14 @@ def _pivot_value_id(value: object) -> str:
     return f"auto-{digest}"
 
 
-def _resolve_automatic_pivot_values(connection, source_sql: str, source_schema: list, pipeline: dict) -> tuple[dict, str]:
+def _resolve_automatic_pivot_values(
+    connection,
+    source_sql: str,
+    source_schema: list,
+    pipeline: dict,
+    columns: list[dict] | None = None,
+    code_mappings: list[dict] | None = None,
+) -> tuple[dict, str]:
     """Resolve an empty PIVOT values list from all rows at that pipeline step."""
     declarative_hash=canonical_hash(pipeline)
     resolved=copy.deepcopy(pipeline)
@@ -40,16 +47,42 @@ def _resolve_automatic_pivot_values(connection, source_sql: str, source_schema: 
         pivot_column=next((item for item in compiled_prefix.output_schema if item.column_id==pivot_column_id),None)
         if pivot_column is None:
             raise ValueError("PIVOT_COLUMN_NOT_FOUND")
+        code_name_physical=None
+        for mapping in code_mappings or []:
+            source_matches=any(
+                (column.get("alias") or column.get("name"))==pivot_column.physical_name
+                and column.get("name")==mapping.get("sourceColumn")
+                and (column.get("table") or None)==(mapping.get("sourceTable") or None)
+                for column in columns or []
+            )
+            if source_matches:
+                code_name_physical=mapping.get("outputColumn")
+                break
+        if code_name_physical:
+            discovery_sql=(
+                f"SELECT {quote_ident(pivot_column.physical_name)} AS __pivot_value, "
+                f"max({quote_ident(code_name_physical)}) AS __pivot_label FROM ({compiled_prefix.sql}) AS __pivot_source "
+                f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT {MAX_PIVOT_VALUES + 1}"
+            )
+        else:
+            discovery_sql=(
+                f"SELECT DISTINCT {quote_ident(pivot_column.physical_name)} AS __pivot_value FROM ({compiled_prefix.sql}) AS __pivot_source "
+                f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL ORDER BY 1 LIMIT {MAX_PIVOT_VALUES + 1}"
+            )
         result=connection.execute(
-            f"SELECT DISTINCT {quote_ident(pivot_column.physical_name)} AS __pivot_value FROM ({compiled_prefix.sql}) AS __pivot_source "
-            f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL ORDER BY 1 LIMIT {MAX_PIVOT_VALUES + 1}",
+            discovery_sql,
             compiled_prefix.parameters,
         ).fetchall()
         if len(result)>MAX_PIVOT_VALUES:
             raise ValueError(f"PIVOT_TOO_MANY_VALUES: 고유값이 {MAX_PIVOT_VALUES}개를 초과하여 가로로 펼칠 수 없습니다.")
         if not result:
             raise ValueError("PIVOT_NO_VALUES: 가로로 펼칠 값이 없습니다.")
-        config["values"]=[{"valueId":_pivot_value_id(row[0]),"value":row[0],"label":str(row[0]),"sort":order} for order,row in enumerate(result,1)]
+        config["values"]=[{
+            "valueId":_pivot_value_id(row[0]),
+            "value":row[0],
+            "label":str(row[1]) if len(row)>1 and row[1] is not None and str(row[1]).strip() else str(row[0]),
+            "sort":order,
+        } for order,row in enumerate(result,1)]
         step["config"]=config
     return resolved,declarative_hash
 
@@ -58,7 +91,14 @@ def compile_pipeline_request(connection_id: str, request: dict, data_root: str |
     source_sql=_source_sql(connection_id,data_root,request)
     described=connection.execute(f"DESCRIBE SELECT * FROM {source_sql}").fetchall()
     source_schema=inspect_source_schema(described,request.get("sourceColumns"))
-    pipeline,declarative_hash=_resolve_automatic_pivot_values(connection,source_sql,source_schema,request.get("pipeline") or {})
+    pipeline,declarative_hash=_resolve_automatic_pivot_values(
+        connection,
+        source_sql,
+        source_schema,
+        request.get("pipeline") or {},
+        request.get("columns") or [],
+        request.get("codeMappings") or [],
+    )
     compiled=compile_pipeline(f"SELECT * FROM {source_sql}",source_schema,pipeline)
     if compiled.pipeline_hash!=declarative_hash:
         compiled=CompiledPipeline(compiled.sql,compiled.parameters,compiled.output_schema,compiled.step_schemas,compiled.warnings,declarative_hash)

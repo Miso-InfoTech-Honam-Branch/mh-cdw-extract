@@ -33,6 +33,26 @@ class TransformCompilerTest(unittest.TestCase):
         self.assertEqual(2,len({item["valueId"] for item in values}))
         self.assertEqual(declarative_hash,canonical_hash(pipeline))
 
+    def test_automatic_pivot_uses_code_names_as_column_labels(self):
+        source_schema=[
+            ColumnSchema("src:item", "항목코드", "항목코드", "STRING", False, ("src:item",)),
+            ColumnSchema("src:name:item", "항목코드__code_name", "항목코드(코드명)", "STRING", True, ("src:name:item",)),
+            ColumnSchema("src:value", "측정값", "측정값", "DECIMAL(12,2)", True, ("src:value",)),
+        ]
+        pipeline={"pipelineVersion":1,"steps":[
+            {"stepId":"pivot","type":"PIVOT","config":{"groupColumnIds":[],"pivotColumnId":"src:item","values":[],"aggregates":[{"aggregateId":"value","op":"MAX","columnId":"src:value","label":"최댓값"}]}},
+            {"stepId":"output","type":"OUTPUT","config":{}},
+        ]}
+        resolved,_=_resolve_automatic_pivot_values(
+            duckdb.connect(),
+            "(VALUES ('11', '신장', 170), ('12', '체중', 60)) AS t(항목코드, 항목코드__code_name, 측정값)",
+            source_schema,
+            pipeline,
+            [{"name":"item_cd","alias":"항목코드"},{"name":"항목코드__code_name"}],
+            [{"sourceColumn":"item_cd","outputColumn":"항목코드__code_name"}],
+        )
+        self.assertEqual({"11":"신장","12":"체중"},{item["value"]:item["label"] for item in resolved["steps"][0]["config"]["values"]})
+
     def test_type_normalization_and_numeric_promotion(self):
         self.assertEqual("STRING", normalize_type("varchar"))
         self.assertEqual("TIMESTAMP_TZ", normalize_type("timestamp with time zone"))
