@@ -5,7 +5,7 @@ import hashlib
 from pathlib import Path
 
 from ..duck import connect, json_safe_rows, quote_ident
-from ..query import SourceResolver, source_from_sql, source_with_code_mappings_sql, single_table_alias
+from ..query import SourceResolver, projection_with_mappings_sql, source_from_sql, source_with_code_mappings_sql, single_table_alias
 from .compiler import MAX_PIVOT_VALUES, CompiledPipeline, canonical_hash, compile_pipeline, inspect_source_schema
 
 
@@ -13,7 +13,9 @@ def _source_sql(connection_id: str, data_root: str | Path, request: dict) -> str
     resolver=SourceResolver(connection_id,data_root)
     default_alias=single_table_alias(request) if str(request.get("sourceType") or "").lower()=="table" else None
     source=source_from_sql(resolver,request)
-    return source_with_code_mappings_sql(resolver,request,source,default_alias)
+    joined=source_with_code_mappings_sql(resolver,request,source,default_alias)
+    projection=projection_with_mappings_sql(request.get("columns") or [],request.get("codeMappings") or [],default_alias)
+    return f"(SELECT {projection} FROM {joined}) AS __pipeline_source"
 
 
 def _pivot_value_id(value: object) -> str:

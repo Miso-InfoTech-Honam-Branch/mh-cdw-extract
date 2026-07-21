@@ -178,8 +178,8 @@ class AsyncExtractTest(unittest.TestCase):
             connection = extract_module.connect()
             try:
                 connection.execute(
-                    "COPY (SELECT ' Seoul ' AS city, 100::BIGINT AS amount "
-                    "UNION ALL SELECT 'Busan', 50) TO ? (FORMAT PARQUET)",
+                    "COPY (SELECT ' Seoul ' AS city, 100::BIGINT AS amount, 'internal-a' AS hidden_value "
+                    "UNION ALL SELECT 'Busan', 50, 'internal-b') TO ? (FORMAT PARQUET)",
                     [source_file.as_posix()],
                 )
             finally:
