@@ -1,3 +1,5 @@
+"""연결별 Parquet 스냅샷 매니페스트를 원자적으로 관리한다."""
+
 from __future__ import annotations
 
 import json
@@ -15,10 +17,14 @@ _MANIFEST_REPLACE_INITIAL_BACKOFF_SECONDS = 0.005
 
 
 def utc_now() -> str:
+    """UTC 현재 시각을 ISO 8601 문자열로 반환한다."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
 def load_connection_manifest(connection_id: str, data_root: str | Path) -> dict:
+    """연결 매니페스트를 읽고 객체 형태와 연결 식별자를 검증한다."""
+
     path = connection_root(data_root, connection_id) / "manifest.json"
     if not path.exists():
         raise FileNotFoundError(f"connection manifest not found: {path}")
@@ -32,6 +38,8 @@ def load_connection_manifest(connection_id: str, data_root: str | Path) -> dict:
 
 
 def save_connection_manifest(connection_id: str, data_root: str | Path, manifest: dict) -> dict:
+    """연결 매니페스트를 임시 파일을 거쳐 원자적으로 게시한다."""
+
     if not isinstance(manifest, dict):
         raise TypeError("connection manifest must be a mapping")
     manifest_connection_id = manifest.get("connectionId")
@@ -66,6 +74,8 @@ def save_connection_manifest(connection_id: str, data_root: str | Path, manifest
 
 
 def delete_connection(connection_id: str, data_root: str | Path) -> dict:
+    """연결의 로컬 스냅샷과 매니페스트 디렉터리를 삭제한다."""
+
     root = connection_root(data_root, connection_id)
     shutil.rmtree(root, ignore_errors=True)
     return {"connectionId": connection_id, "state": "DELETED"}

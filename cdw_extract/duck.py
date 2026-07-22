@@ -1,3 +1,5 @@
+"""DuckDB 연결의 전역 자원 제한, 취소, SQL 보조 기능을 제공한다."""
+
 from __future__ import annotations
 
 import json
@@ -20,10 +22,14 @@ from .execution_scope import current_execution_resources
 
 
 def quote_ident(value: str) -> str:
+    """DuckDB 식별자를 큰따옴표로 안전하게 인용한다."""
+
     return '"' + value.replace('"', '""') + '"'
 
 
 def sql_literal(value: object) -> str:
+    """값을 SQL 문자열 리터럴로 안전하게 인용한다."""
+
     return "'" + str(value).replace("'", "''") + "'"
 
 
@@ -241,7 +247,7 @@ def _temp_root(
 
 
 class ManagedDuckDBConnection:
-    """One bounded DuckDB operation with an isolated, disposable spill directory."""
+    """격리된 일회용 spill 경로와 자원 상한을 갖는 단일 DuckDB 작업 연결이다."""
 
     def __init__(
         self,
@@ -412,10 +418,14 @@ def connect(
     budget: ResourceBudget | None = None,
     temp_root: str | Path | None = None,
 ) -> ManagedDuckDBConnection:
+    """호스트 자원 한도 안에서 격리된 DuckDB 연결을 연다."""
+
     return ManagedDuckDBConnection(data_root, operation, operation_id, budget, temp_root)
 
 
 def source_attach_sql(source: dict) -> tuple[str, str]:
+    """원격 DB 공급자에 맞는 DuckDB 확장명과 읽기 전용 ATTACH SQL을 만든다."""
+
     vendor = (source.get("vendor") or "postgresql").lower()
     if vendor == "postgresql":
         ext = "postgres"
@@ -442,6 +452,8 @@ def source_attach_sql(source: dict) -> tuple[str, str]:
 
 
 def source_table_sql(source: dict, table: dict) -> str:
+    """ATTACH된 원격 테이블의 완전한 인용 이름을 반환한다."""
+
     schema = table.get("schemaName") or source.get("schemaName")
     name = table.get("tableName")
     if not name:
@@ -452,6 +464,8 @@ def source_table_sql(source: dict, table: dict) -> str:
 
 
 def parquet_scan(path: str | Path, alias: str | None = None) -> str:
+    """선택적 별칭을 포함한 read_parquet 소스 표현식을 만든다."""
+
     sql = f"read_parquet({sql_literal(Path(path).as_posix())})"
     if alias:
         sql += f" AS {quote_ident(alias)}"
@@ -459,4 +473,6 @@ def parquet_scan(path: str | Path, alias: str | None = None) -> str:
 
 
 def json_safe_rows(rows: list[dict]) -> list[dict]:
+    """날짜 등 비표준 값을 문자열로 바꿔 행 목록을 JSON 호환 형태로 만든다."""
+
     return json.loads(json.dumps(rows, default=str, ensure_ascii=False))

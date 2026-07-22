@@ -1,3 +1,5 @@
+"""변환 파이프라인이 없는 일반 추출 미리보기를 실행한다."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +12,8 @@ MAX_LIMIT = 100000
 
 
 def normalized_limit(value: int | None) -> int:
+    """미리보기 행 제한을 기본값과 최대 허용 범위로 정규화한다."""
+
     if not value or value <= 0:
         return DEFAULT_LIMIT
     if value > MAX_LIMIT:
@@ -18,6 +22,8 @@ def normalized_limit(value: int | None) -> int:
 
 
 def preview(connection_id: str, request: dict, data_root: str | Path) -> dict:
+    """추출 SQL을 제한된 행 수로 실행하고 JSON 안전한 미리보기를 반환한다."""
+
     limit = normalized_limit(request.get("limit"))
     sql = final_query(connection_id, data_root, request, limit=limit)
     conn = connect(data_root, "preview", request.get("requestId"))

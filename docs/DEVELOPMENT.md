@@ -17,6 +17,8 @@
 | 분석 DSL을 SQL로 변환 | `analytics_compiler.py` |
 | 분석 실행 | `analytics.py` |
 | PNG/PDF/XLSX 결과 파일 | `analytics_artifacts.py` |
+| 큐 비종속 실행 수명·취소·예산 | `engine.py`, `runtime.py` |
+| 추출 요청 정규화·원자 게시 | `extract.py` |
 | callback HTTP 전송·재시도 | `callback.py` |
 | 사용자 데이터셋 Parquet | `user_dataset.py` |
 | 메타데이터 동기화 | `refresh.py` |
@@ -29,6 +31,8 @@
 
 - Boot API의 설명형 `camelCase` 필드는 Pydantic alias로 받고, Python 내부에서는 같은 개념의
   `snake_case`를 사용한다.
+- 레거시 추출 `dict` 요청도 `ValidatedExtractRequest`, `ExtractResultTarget`처럼 불변 값으로
+  경계에서 한 번 정규화한다. 실행·게시 코드에 `request.get("camelCase")`를 반복해서 늘리지 않는다.
 - `analysisArtifactId`처럼 대상이 분명한 이름을 사용하고 `artifactId` 같은 축약 계약을 새로 만들지 않는다.
 - 요청, 접수 응답, job manifest, callback에서 동일한 개념은 동일한 JSON 필드명을 사용한다.
 - 현재는 DB와 작업 파일을 초기화하는 개발 단계이므로 구형 필드 fallback이나 이중 직렬화를 두지 않는다.
@@ -41,7 +45,9 @@
 - 핵심 모듈이 FastAPI, BackgroundTasks 또는 운영 호스트의 큐 클래스에 의존하지 않게 한다.
 - 사용자 값은 SQL 문자열에 직접 이어 붙이지 않고 파라미터로 전달한다.
 - 파일 경로는 기존 `safe_segment` 계열 검증을 통과시킨다.
-- 긴 작업은 취소 여부를 주기적으로 검사하고 임시 파일을 원자적으로 교체한다.
+- 긴 작업은 취소 여부를 주기적으로 검사한다. Parquet과 manifest·schema는 최종 저장소의 고유
+  staging 세대에서 모두 완성한 뒤 디렉터리 단위로 원자 게시한다. 작업 공간과 최종 저장소가
+  다른 파일 시스템이어도 최종 교체는 같은 파일 시스템 안에서 일어나야 한다.
 - 작업 모듈은 callback payload와 오류 기록만 담당하고 HTTP 전송은 `callback.py`를 사용한다.
 - Pydantic 모델 변경 시 Boot DTO와 Vue 직렬화 코드를 함께 수정한다.
 - 주석과 docstring에는 동시성, 보안 경계, 포맷 제약처럼 코드만으로 드러나지 않는 이유를 쓴다.
@@ -49,8 +55,16 @@
 ## 검증
 
 ```powershell
-python -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\ruff.exe check cdw_extract tests
 ```
 
 Python 3.11 이상이 필요하다. 새 분석 연산자는 정상 입력뿐 아니라 잘못된 타입, 존재하지 않는
 컬럼, SQL 주입 형태의 입력, 결과 제한 케이스를 함께 테스트한다.
+
+`tests/test_architecture_boundaries.py`는 운영 패키지가 FastAPI·루트 app·특정 큐 호스트를
+역참조하지 않는지 검사한다. 실패하면 import 예외를 추가하지 말고 adapter와 core의 책임 위치를
+다시 정한다.
+
+Ruff의 `C90` 게이트는 함수 복잡도 16을 상한으로 사용한다. 분기가 더 필요해지면 `noqa`나 상한
+증가로 숨기지 말고, 계산 전략·자원 수명·게시 단계처럼 함께 바뀌는 책임으로 먼저 나눈다.

@@ -1,10 +1,12 @@
+"""사용자 데이터셋 변환의 비동기 작업 상태와 콜백을 관리한다."""
+
 from __future__ import annotations
 
 import uuid
 from pathlib import Path
 from typing import Any
 
-from .jobs import create_job, normalize_job_id, save_job, update_job
+from .jobs import create_job, job_failure_fields, normalize_job_id, save_job, update_job
 from .user_dataset import (
     USER_DATASET_CONVERT,
     convert_user_dataset_file_from_path,
@@ -17,6 +19,8 @@ from .user_dataset import (
 
 
 def user_dataset_failed_payload(request: dict, exc: Exception) -> dict:
+    """업로드 변환 예외를 Boot 호환 실패 콜백 본문으로 변환한다."""
+
     return {
         "requestId": request.get("requestId") or request.get("userDatasetFileId"),
         "jobId": request.get("jobId"),
@@ -39,6 +43,8 @@ def prepare_user_dataset_convert_job(
     user_dataset_file_id: str,
     request: dict,
 ) -> tuple[dict, Path | None, dict]:
+    """업로드를 한 번만 저장하고 멱등적인 ACCEPTED 변환 작업을 준비한다."""
+
     job_id = normalize_job_id(str(request.get("jobId") or uuid.uuid4()))
     user_id = safe_segment(request.get("userId"), "userId")
     user_dataset_id = safe_segment(user_dataset_id, "userDatasetId")
@@ -81,15 +87,14 @@ def prepare_user_dataset_convert_job(
             copy_upload_file(upload, upload_path)
             accepted = update_job(data_root, job_id, lambda current: {**current, "state": "ACCEPTED"})
         except Exception as exc:
+            failure_fields = job_failure_fields(exc, include_error=True)
             update_job(
                 data_root,
                 job_id,
                 lambda current: {
                     **current,
                     "state": "FAILED",
-                    "errorCode": type(exc).__name__,
-                    "error": str(exc),
-                    "message": str(exc),
+                    **failure_fields,
                 },
             )
             raise
@@ -106,6 +111,8 @@ def prepare_user_dataset_convert_job(
 
 
 def run_user_dataset_convert_job(upload_path: str | Path, data_root: str | Path, request: dict) -> None:
+    """수락된 변환을 단일 워커가 선점해 상태 저장과 종단 콜백까지 수행한다."""
+
     job_id = request["jobId"]
     runner_token = uuid.uuid4().hex
     claimed = update_job(

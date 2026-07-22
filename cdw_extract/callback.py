@@ -49,6 +49,8 @@ def post_json_callback(
     headers = callback.get("headers") or {}
     timeout = float(callback.get("timeoutSeconds") or callback.get("timeout") or 10)
     last_error: Exception | None = None
+    # 모든 시도는 동일한 종단 payload를 재전송한다. 여기서는 작업 상태를
+    # 바꾸지 않고, 최종 실패만 호출자에게 돌려 영속 기록 책임을 분리한다.
     for attempt in range(1, attempts + 1):
         try:
             response = post(url, json=dict(payload), headers=headers, timeout=timeout)
@@ -70,4 +72,3 @@ def post_json_callback(
     if last_error is None:
         last_error = RuntimeError(f"{operation} callback failed without a response")
     raise last_error
-

@@ -1,3 +1,5 @@
+"""테이블·조인·코드 매핑 요청을 안전한 DuckDB SQL로 조립한다."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,10 +17,14 @@ USER_DATST = "USER_DATST"
 
 
 def table_alias(table: dict) -> str:
+    """테이블 참조에 사용할 우선순위 기반 별칭을 반환한다."""
+
     return table.get("alias") or table.get("tableId") or table.get("tableName") or table.get("userDatasetFileId")
 
 
 def normalized_source_kind(value: object) -> str:
+    """호환 입력 이름을 메타데이터 테이블 또는 사용자 데이터셋 종류로 정규화한다."""
+
     raw = str(value or MTDT_TBL).strip().upper().replace("-", "_")
     if raw in {"", MTDT_TBL, "DB_TABLE"}:
         return MTDT_TBL
@@ -28,6 +34,8 @@ def normalized_source_kind(value: object) -> str:
 
 
 def table_source_kind(table: dict) -> str:
+    """테이블 요청의 레거시·현재 필드에서 소스 종류를 해석한다."""
+
     value = table.get("sourceKind")
     if value is None and str(table.get("sourceType") or "").strip().upper() in {MTDT_TBL, USER_DATST, "USER_DATASET", "DB_TABLE"}:
         value = table.get("sourceType")
@@ -35,6 +43,8 @@ def table_source_kind(table: dict) -> str:
 
 
 def table_user_dataset_file_ref(table: dict) -> tuple[str, str, str] | None:
+    """사용자 데이터셋 파일 식별자 세 쌍을 검증해 반환한다."""
+
     user_id = table.get("userId")
     user_dataset_id = table.get("userDatasetId") or table.get("userDatstId") or table.get("sourceId")
     user_dataset_file_id = table.get("userDatasetFileId") or table.get("userDatstFileId") or table.get("fileId")
@@ -50,6 +60,8 @@ def table_user_dataset_file_ref(table: dict) -> tuple[str, str, str] | None:
 
 
 def table_ref_from_manifest(manifest: dict, table: dict) -> dict:
+    """연결 매니페스트에서 식별자 또는 스키마·이름이 일치하는 테이블을 찾는다."""
+
     table_id = table.get("tableId")
     schema = table.get("schemaName")
     name = table.get("tableName")
@@ -62,6 +74,8 @@ def table_ref_from_manifest(manifest: dict, table: dict) -> dict:
 
 
 def connection_table_path(data_root: str | Path, connection_id: str, manifest: dict, table: dict) -> Path:
+    """매니페스트 테이블 경로가 연결의 tables 디렉터리 안인지 검증한다."""
+
     item = table_ref_from_manifest(manifest, table)
     raw_path = item.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
@@ -81,6 +95,8 @@ def connection_table_path(data_root: str | Path, connection_id: str, manifest: d
 
 
 class SourceResolver:
+    """연결·사용자 데이터셋 매니페스트를 캐시하며 정규 Parquet 경로를 해석한다."""
+
     def __init__(self, connection_id: str, data_root: str | Path):
         self.connection_id = connection_id
         self.data_root = Path(data_root)
@@ -156,10 +172,14 @@ class SourceResolver:
 
 
 def output_column_name(column: dict) -> str:
+    """투영 열의 출력 별칭 또는 원래 이름을 반환한다."""
+
     return column.get("alias") or column["name"]
 
 
 def column_expr(column: dict, default_alias: str | None = None) -> str:
+    """선택적 테이블 별칭을 포함한 인용 열 표현식을 만든다."""
+
     table = column.get("table") or default_alias
     name = column["name"]
     if table:
@@ -168,6 +188,8 @@ def column_expr(column: dict, default_alias: str | None = None) -> str:
 
 
 def projection_sql(columns: list[dict], default_alias: str | None = None) -> str:
+    """요청 열 목록을 명시적 출력 별칭이 있는 SELECT 투영으로 변환한다."""
+
     if not columns:
         return "*"
     parts = []
@@ -179,11 +201,15 @@ def projection_sql(columns: list[dict], default_alias: str | None = None) -> str
 
 
 def mapping_output_expr(mapping: dict, index: int) -> str:
+    """코드 매핑 테이블의 이름 열을 요청 출력 열로 투영한다."""
+
     output = mapping["outputColumn"]
     return f"{quote_ident(f'__code_map_{index}')}.{quote_ident(mapping['codeNameColumn'])} AS {quote_ident(output)}"
 
 
 def projection_with_mappings_sql(columns: list[dict], mappings: list[dict], default_alias: str | None = None) -> str:
+    """일반 열과 코드명 치환 열을 결합한 SELECT 투영을 만든다."""
+
     outputs = {mapping["outputColumn"]: i for i, mapping in enumerate(mappings or [])}
     if not columns:
         parts = ["*"]
@@ -202,6 +228,8 @@ def projection_with_mappings_sql(columns: list[dict], mappings: list[dict], defa
 
 
 def filter_sql(filters: list[dict]) -> str:
+    """허용 목록 기반 필터 요청을 AND로 연결된 SQL 조건으로 만든다."""
+
     clauses = []
     for item in filters or []:
         col = quote_ident(item["column"])
@@ -234,6 +262,8 @@ def filter_sql(filters: list[dict]) -> str:
 
 
 def sort_sql(sorts: list[dict]) -> str:
+    """출력 열 정렬 요청을 인용된 ORDER BY 항목으로 만든다."""
+
     parts = []
     for item in sorts or []:
         direction = "DESC" if (item.get("direction") or "asc").lower() == "desc" else "ASC"
@@ -242,6 +272,8 @@ def sort_sql(sorts: list[dict]) -> str:
 
 
 def single_table_request(request: dict) -> dict:
+    """단일 테이블 추출 요청을 공통 테이블 참조 형태로 변환한다."""
+
     return {
         "sourceKind": request.get("sourceKind"),
         "userId": request.get("userId"),
@@ -255,10 +287,14 @@ def single_table_request(request: dict) -> dict:
 
 
 def single_table_alias(request: dict) -> str:
+    """단일 소스에 사용할 안정적인 DuckDB 별칭을 반환한다."""
+
     return request.get("alias") or request.get("tableName") or request.get("tableId") or "__src"
 
 
 def join_type_sql(value: object) -> str:
+    """요청 조인 유형을 지원되는 DuckDB JOIN 키워드로 정규화한다."""
+
     raw = str(value or "inner").strip().upper().replace("_", " ")
     if raw in {"LEFT", "LEFT JOIN"}:
         return "LEFT JOIN"
@@ -270,6 +306,8 @@ def join_type_sql(value: object) -> str:
 
 
 def source_from_sql(resolver: SourceResolver, request: dict) -> str:
+    """단일 Parquet 소스 또는 검증된 다중 테이블 JOIN 절을 조립한다."""
+
     source_type = (request.get("sourceType") or "").lower()
     if source_type == "table":
         table = single_table_request(request)
@@ -291,6 +329,8 @@ def source_from_sql(resolver: SourceResolver, request: dict) -> str:
             raise ValueError("baseTable must match one of tables[].alias/tableId/tableName")
         base_path = resolver.table_path(table_map[base_alias])
         sql = parquet_scan(base_path, base_alias)
+        # 조인은 요청 순서대로 이어 붙인다. 각 단계의 키만 SQL로 만들고
+        # 파일 경로와 식별자는 앞선 해석·인용 경계를 통과한 값만 사용한다.
         for join in request.get("joins") or []:
             right_alias = join["rightTable"]
             if right_alias not in table_map:
@@ -312,6 +352,8 @@ def source_from_sql(resolver: SourceResolver, request: dict) -> str:
 
 
 def mapping_source_expr(request: dict, mapping: dict, default_alias: str | None) -> str:
+    """코드 매핑의 원본 코드 열을 정확한 소스 별칭에 연결한다."""
+
     source_table = mapping.get("sourceTable")
     if source_table:
         return f"{quote_ident(source_table)}.{quote_ident(mapping['sourceColumn'])}"
@@ -328,6 +370,8 @@ def source_with_code_mappings_sql(
     source: str,
     default_alias: str | None,
 ) -> str:
+    """코드 테이블을 LEFT JOIN해 매핑 실패 시 원본 행을 보존한다."""
+
     sql = source
     for index, mapping in enumerate(request.get("codeMappings") or []):
         table = {
@@ -343,6 +387,8 @@ def source_with_code_mappings_sql(
         alias = f"__code_map_{index}"
         left = mapping_source_expr(request, mapping, default_alias)
         right = f"{quote_ident(alias)}.{quote_ident(mapping['codeColumn'])}"
+        # 서로 다른 DB에서 수집된 코드 열의 물리 타입이 달라도 의미상
+        # 동일한 코드가 매칭되도록 양쪽을 VARCHAR로 통일한다.
         sql += (
             f" LEFT JOIN {parquet_scan(path, alias)}"
             f" ON CAST({left} AS VARCHAR) = CAST({right} AS VARCHAR)"
@@ -351,6 +397,8 @@ def source_with_code_mappings_sql(
 
 
 def final_query(connection_id: str, data_root: str | Path, request: dict, limit: int | None = None) -> str:
+    """소스, 투영, 매핑, 필터, 정렬, 제한을 최종 추출 SQL로 결합한다."""
+
     resolver = SourceResolver(connection_id, data_root)
     default_alias = None
     if (request.get("sourceType") or "").lower() == "table":
@@ -365,6 +413,8 @@ def final_query(connection_id: str, data_root: str | Path, request: dict, limit:
         f"SELECT {projection_with_mappings_sql(request.get('columns') or [], request.get('codeMappings') or [], default_alias)} "
         f"FROM {source}"
     )
+    # 매핑으로 새로 만든 출력 열이나 투영 별칭도 필터·정렬할 수 있도록
+    # 먼저 내부 SELECT를 확정한 다음 외부 질의에 조건을 적용한다.
     sql = f"SELECT * FROM ({inner}) AS __base"
     where = filter_sql(request.get("filters") or [])
     if where:

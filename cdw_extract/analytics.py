@@ -1,3 +1,5 @@
+"""DuckDB 기반 분석 질의와 상세 행 조회를 실행한다."""
+
 from __future__ import annotations
 
 import hashlib
@@ -193,6 +195,8 @@ def run_analytics_query(
     request: AnalyticsQueryRequest,
     data_root: str | Path,
 ) -> AnalyticsQueryResponse:
+    """분석 요청을 컴파일·실행하고 JSON 안전한 차트 결과를 반환한다."""
+
     started = time.perf_counter()
     source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics", request.request_id)
@@ -304,6 +308,8 @@ def run_analytics_detail(
     request: AnalyticsDetailRequest,
     data_root: str | Path,
 ) -> AnalyticsDetailResponse:
+    """선택한 분석 지점에 대응하는 원본 상세 행을 조회한다."""
+
     started = time.perf_counter()
     source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics-detail", request.request_id)

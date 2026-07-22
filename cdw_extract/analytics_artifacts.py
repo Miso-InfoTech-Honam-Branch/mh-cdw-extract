@@ -17,9 +17,10 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import requests
 
@@ -30,7 +31,13 @@ from cdw_extract.analytics_models import (
     AnalyticsQueryRequest,
     ArtifactFormat,
 )
-from cdw_extract.jobs import TERMINAL_STATES, create_job, load_job, normalize_job_id, update_job
+from cdw_extract.jobs import (
+    TERMINAL_STATES,
+    create_job,
+    job_failure_fields,
+    normalize_job_id,
+    update_job,
+)
 from cdw_extract.user_dataset import file_sha256, safe_segment
 
 
@@ -53,6 +60,8 @@ _render_slots: threading.BoundedSemaphore | None = None
 
 
 class ArtifactCancelled(RuntimeError):
+    """렌더링 중 삭제나 취소 요청으로 산출물을 게시할 수 없음을 나타낸다."""
+
     pass
 
 
@@ -112,6 +121,8 @@ def _artifact_render_slot(
 
 
 def utc_now() -> str:
+    """UTC 현재 시각을 ISO 8601 문자열로 반환한다."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -125,10 +136,14 @@ def _identity_segment(value: object, field_name: str) -> str:
 
 
 def artifacts_root(data_root: str | Path) -> Path:
+    """분석 산출물 컬렉션의 루트 경로를 반환한다."""
+
     return Path(data_root).expanduser().resolve() / "analysis-artifacts"
 
 
 def artifact_root(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
+    """사용자와 산출물 식별자에 해당하는 안전한 저장 경로를 반환한다."""
+
     return (
         artifacts_root(data_root)
         / _identity_segment(user_id, "userId")
@@ -137,10 +152,14 @@ def artifact_root(data_root: str | Path, user_id: str, analysis_artifact_id: str
 
 
 def artifact_manifest_path(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> Path:
+    """분석 산출물 매니페스트의 정규 경로를 반환한다."""
+
     return artifact_root(data_root, user_id, analysis_artifact_id) / "meta" / "manifest.json"
 
 
 def artifact_relative_path(user_id: str, analysis_artifact_id: str, file_name: str) -> str:
+    """데이터 루트 기준 분석 산출물 파일 키를 만든다."""
+
     return (
         f"analysis-artifacts/{_identity_segment(user_id, 'userId')}/"
         f"{_identity_segment(analysis_artifact_id, 'analysisArtifactId')}/files/{file_name}"
@@ -262,6 +281,8 @@ def prepare_analysis_artifact_job(
     request: AnalyticsArtifactRequest,
     data_root: str | Path,
 ) -> dict:
+    """산출물 식별자를 예약하고 멱등적인 비동기 작업을 생성한다."""
+
     normalized = request.model_copy(
         update={
             "job_id": normalize_job_id(request.job_id),
@@ -947,11 +968,10 @@ def render_analysis_artifact_operation(
     cancellation: object | None = None,
     check_tombstone: bool = False,
 ) -> dict[str, object]:
-    """Render one artifact without job state mutation or callback delivery.
+    """작업 상태 변경이나 콜백 없이 분석 산출물 하나를 렌더링한다.
 
-    The caller owns durable job transitions and publication.  The legacy HTTP
-    runner opts into its deletion tombstone, while queue hosts use only their
-    injected cancellation token.
+    호출자가 영속 상태 전이와 게시를 책임진다. 기존 HTTP 실행기는 삭제 tombstone을
+    확인하고, 큐 호스트는 주입한 취소 토큰만 사용한다.
     """
 
     staging = Path(staging_root).expanduser().resolve()
@@ -1094,54 +1114,124 @@ def _deliver_callback(
             pass
 
 
-def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str | Path) -> None:
-    runner_token = uuid.uuid4().hex
-    claimed = update_job(
-        data_root,
-        request.job_id,
-        lambda current: {**current, "state": "RUNNING", "runnerToken": runner_token}
-        if current.get("state") == "ACCEPTED"
-        else current,
-    )
-    if claimed.get("state") == "SUCCESS":
-        try:
-            manifest = load_analysis_artifact_manifest(data_root, request.user_id, request.analysis_artifact_id)
-            _deliver_callback(data_root, request, _callback_payload(request, READY, manifest))
-        except Exception:
-            pass
-        return
-    if claimed.get("runnerToken") != runner_token:
-        return
+@contextmanager
+def _active_artifact_cancellation(
+    job_id: str,
+    cancellation: threading.Event,
+) -> Iterator[None]:
+    """레거시 삭제 API가 현재 렌더링 한 건에만 취소 신호를 보내도록 등록한다."""
 
-    event = threading.Event()
     with _active_guard:
-        _active_cancellations[request.job_id] = event
-    staging_root = artifacts_root(data_root) / "_staging" / request.job_id
-    shutil.rmtree(staging_root, ignore_errors=True)
-    staging_root.mkdir(parents=True, exist_ok=False)
+        _active_cancellations[job_id] = cancellation
     try:
+        yield
+    finally:
+        with _active_guard:
+            if _active_cancellations.get(job_id) is cancellation:
+                _active_cancellations.pop(job_id, None)
+
+
+@dataclass(slots=True)
+class _AnalysisArtifactJobRun:
+    """분석 산출물 한 건의 선점, staging, 게시와 종단 보고를 소유한다."""
+
+    request: AnalyticsArtifactRequest
+    data_root: str | Path
+    runner_token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    cancellation: threading.Event = field(default_factory=threading.Event)
+    staging_root: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.staging_root = artifacts_root(self.data_root) / "_staging" / self.request.job_id
+
+    def run(self) -> None:
+        claimed = self._claim()
+        if claimed.get("state") == "SUCCESS":
+            self._redeliver_success_callback()
+            return
+        if claimed.get("runnerToken") != self.runner_token:
+            return
+
+        with _active_artifact_cancellation(self.request.job_id, self.cancellation):
+            try:
+                self._prepare_staging()
+                manifest = self._render_and_publish()
+                self._commit_success(manifest)
+                _deliver_callback(
+                    self.data_root,
+                    self.request,
+                    _callback_payload(self.request, READY, manifest),
+                    self.cancellation,
+                )
+            except ArtifactCancelled as exc:
+                self._record_cancelled(exc)
+            except Exception as exc:
+                self._record_failure_or_deletion(exc)
+
+    def _claim(self) -> dict:
+        return update_job(
+            self.data_root,
+            self.request.job_id,
+            lambda current: {
+                **current,
+                "state": "RUNNING",
+                "runnerToken": self.runner_token,
+            }
+            if current.get("state") == "ACCEPTED"
+            else current,
+        )
+
+    def _redeliver_success_callback(self) -> None:
+        try:
+            manifest = load_analysis_artifact_manifest(
+                self.data_root,
+                self.request.user_id,
+                self.request.analysis_artifact_id,
+            )
+            _deliver_callback(
+                self.data_root,
+                self.request,
+                _callback_payload(self.request, READY, manifest),
+            )
+        except Exception:
+            # 결과는 이미 SUCCESS다. 재조정용 콜백 실패가 확정 결과를 바꾸지 않는다.
+            pass
+
+    def _prepare_staging(self) -> None:
+        shutil.rmtree(self.staging_root, ignore_errors=True)
+        self.staging_root.mkdir(parents=True, exist_ok=False)
+
+    def _render_and_publish(self) -> dict[str, Any]:
         operation = render_analysis_artifact_operation(
-            request,
-            data_root,
-            staging_root,
-            cancellation=event,
+            self.request,
+            self.data_root,
+            self.staging_root,
+            cancellation=self.cancellation,
             check_tombstone=True,
         )
-        output = Path(operation["filePath"])
+        manifest = self._build_manifest(operation)
+        _atomic_json(self.staging_root / "meta" / "manifest.json", manifest)
+        return self._publish_staging(manifest)
+
+    def _build_manifest(self, operation: dict[str, object]) -> dict[str, Any]:
         file_name = str(operation["fileName"])
-        manifest = {
+        return {
             "schemaVersion": 1,
-            "jobId": request.job_id,
+            "jobId": self.request.job_id,
             "jobType": ANALYSIS_ARTIFACT,
-            "requestId": request.request_id,
-            "analysisArtifactId": request.analysis_artifact_id,
-            "analysisId": request.analysis_id,
-            "userId": request.user_id,
-            "name": request.name,
-            "format": request.format.value,
+            "requestId": self.request.request_id,
+            "analysisArtifactId": self.request.analysis_artifact_id,
+            "analysisId": self.request.analysis_id,
+            "userId": self.request.user_id,
+            "name": self.request.name,
+            "format": self.request.format.value,
             "status": READY,
             "fileName": file_name,
-            "relativePath": artifact_relative_path(request.user_id, request.analysis_artifact_id, file_name),
+            "relativePath": artifact_relative_path(
+                self.request.user_id,
+                self.request.analysis_artifact_id,
+                file_name,
+            ),
             "contentType": operation["contentType"],
             "sizeBytes": operation["sizeBytes"],
             "sha256Checksum": operation["sha256Checksum"],
@@ -1152,69 +1242,115 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
             "sourceVersions": operation["sourceVersions"],
             "createdAt": utc_now(),
         }
-        _atomic_json(staging_root / "meta" / "manifest.json", manifest)
-        final_root = artifact_root(data_root, request.user_id, request.analysis_artifact_id)
-        with _artifact_lock(data_root, request.user_id, request.analysis_artifact_id):
-            _check_cancelled(data_root, request, event)
+
+    def _publish_staging(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        final_root = artifact_root(
+            self.data_root,
+            self.request.user_id,
+            self.request.analysis_artifact_id,
+        )
+        # 파일과 매니페스트가 든 디렉터리 전체를 교체해 부분 산출물을 숨긴다.
+        with _artifact_lock(
+            self.data_root,
+            self.request.user_id,
+            self.request.analysis_artifact_id,
+        ):
+            _check_cancelled(self.data_root, self.request, self.cancellation)
             if final_root.exists():
-                existing = load_analysis_artifact_manifest(data_root, request.user_id, request.analysis_artifact_id)
-                if existing.get("jobId") != request.job_id:
+                existing = load_analysis_artifact_manifest(
+                    self.data_root,
+                    self.request.user_id,
+                    self.request.analysis_artifact_id,
+                )
+                if existing.get("jobId") != self.request.job_id:
                     raise FileExistsError("analysis artifact target already exists")
-                manifest = existing
-                shutil.rmtree(staging_root, ignore_errors=True)
-            else:
-                final_root.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(staging_root, final_root)
+                shutil.rmtree(self.staging_root, ignore_errors=True)
+                return existing
+            final_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(self.staging_root, final_root)
+            return manifest
+
+    def _commit_success(self, manifest: dict[str, Any]) -> None:
+        success_fields = {
+            "state": "SUCCESS",
+            "fileName": manifest["fileName"],
+            "relativePath": manifest["relativePath"],
+            "contentType": manifest["contentType"],
+            "sizeBytes": manifest["sizeBytes"],
+            "sha256Checksum": manifest["sha256Checksum"],
+            "sourceVersion": manifest["sourceVersion"],
+            "chartCount": manifest["chartCount"],
+            "renderWarnings": manifest.get("renderWarnings") or [],
+        }
         saved = update_job(
-            data_root,
-            request.job_id,
-            lambda current: {
-                **current,
-                "state": "SUCCESS",
-                "fileName": manifest["fileName"],
-                "relativePath": manifest["relativePath"],
-                "contentType": manifest["contentType"],
-                "sizeBytes": manifest["sizeBytes"],
-                "sha256Checksum": manifest["sha256Checksum"],
-                "sourceVersion": manifest["sourceVersion"],
-                "chartCount": manifest["chartCount"],
-                "renderWarnings": manifest.get("renderWarnings") or [],
-            },
+            self.data_root,
+            self.request.job_id,
+            lambda current: {**current, **success_fields},
         )
         if saved.get("state") != "SUCCESS":
-            raise ArtifactCancelled("Artifact was cancelled before completion could be committed.")
-        _deliver_callback(data_root, request, _callback_payload(request, READY, manifest), event)
-    except ArtifactCancelled as exc:
-        shutil.rmtree(staging_root, ignore_errors=True)
+            raise ArtifactCancelled(
+                "Artifact was cancelled before completion could be committed."
+            )
+
+    def _record_cancelled(self, exc: ArtifactCancelled) -> None:
+        shutil.rmtree(self.staging_root, ignore_errors=True)
+        cancelled_message = str(exc)
         update_job(
-            data_root,
-            request.job_id,
-            lambda current: current if current.get("state") in TERMINAL_STATES else {**current, "state": "CANCELLED", "message": str(exc)},
+            self.data_root,
+            self.request.job_id,
+            lambda current: current
+            if current.get("state") in TERMINAL_STATES
+            else {
+                **current,
+                "state": "CANCELLED",
+                "message": cancelled_message,
+            },
         )
-        _deliver_callback(data_root, request, _callback_payload(request, "CANCELLED", exc=exc))
-    except Exception as exc:
-        shutil.rmtree(staging_root, ignore_errors=True)
-        if _tombstone_path(data_root, request.user_id, request.analysis_artifact_id).exists():
-            cancelled = ArtifactCancelled("Analysis artifact generation was cancelled by deletion.")
-            update_job(
-                data_root,
-                request.job_id,
-                lambda current: current if current.get("state") in TERMINAL_STATES else {**current, "state": "CANCELLED", "message": str(cancelled)},
+        _deliver_callback(
+            self.data_root,
+            self.request,
+            _callback_payload(self.request, "CANCELLED", exc=exc),
+        )
+
+    def _record_failure_or_deletion(self, exc: Exception) -> None:
+        shutil.rmtree(self.staging_root, ignore_errors=True)
+        if _tombstone_path(
+            self.data_root,
+            self.request.user_id,
+            self.request.analysis_artifact_id,
+        ).exists():
+            cancelled = ArtifactCancelled(
+                "Analysis artifact generation was cancelled by deletion."
             )
-            _deliver_callback(data_root, request, _callback_payload(request, "CANCELLED", exc=cancelled))
-        else:
-            update_job(
-                data_root,
-                request.job_id,
-                lambda current: {**current, "state": "FAILED", "errorCode": type(exc).__name__, "message": str(exc)},
-            )
-            _deliver_callback(data_root, request, _callback_payload(request, "FAILED", exc=exc))
-    finally:
-        with _active_guard:
-            _active_cancellations.pop(request.job_id, None)
+            self._record_cancelled(cancelled)
+            return
+
+        failure_fields = job_failure_fields(exc)
+        update_job(
+            self.data_root,
+            self.request.job_id,
+            lambda current: {
+                **current,
+                "state": "FAILED",
+                **failure_fields,
+            },
+        )
+        _deliver_callback(
+            self.data_root,
+            self.request,
+            _callback_payload(self.request, "FAILED", exc=exc),
+        )
+
+
+def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str | Path) -> None:
+    """산출물 작업을 선점해 렌더링·원자 게시·종단 콜백까지 수행한다."""
+
+    _AnalysisArtifactJobRun(request, data_root).run()
 
 
 def load_analysis_artifact_manifest(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> dict:
+    """READY 상태인 산출물 매니페스트를 읽고 요청 식별자와 일치하는지 검증한다."""
+
     user_id = _identity_segment(user_id, "userId")
     analysis_artifact_id = _identity_segment(analysis_artifact_id, "analysisArtifactId")
     path = artifact_manifest_path(data_root, user_id, analysis_artifact_id)
@@ -1229,6 +1365,8 @@ def load_analysis_artifact_manifest(data_root: str | Path, user_id: str, analysi
 
 
 def analysis_artifact_download(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> tuple[Path, dict]:
+    """정규 경로, 크기, 체크섬을 검증한 다운로드 파일과 매니페스트를 반환한다."""
+
     manifest = load_analysis_artifact_manifest(data_root, user_id, analysis_artifact_id)
     root = Path(data_root).expanduser().resolve()
     relative = Path(str(manifest.get("relativePath") or ""))
@@ -1248,6 +1386,8 @@ def analysis_artifact_download(data_root: str | Path, user_id: str, analysis_art
 
 
 def delete_analysis_artifact(data_root: str | Path, user_id: str, analysis_artifact_id: str) -> dict:
+    """재생성을 막는 tombstone을 남기고 실행 중이거나 완료된 산출물을 삭제한다."""
+
     user_id = _identity_segment(user_id, "userId")
     analysis_artifact_id = _identity_segment(analysis_artifact_id, "analysisArtifactId")
     job_id: str | None = None

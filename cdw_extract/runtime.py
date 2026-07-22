@@ -1,4 +1,4 @@
-"""Execution context and host services for queue-neutral jobs."""
+"""큐 중립 작업의 실행 컨텍스트와 호스트 제공 서비스를 정의한다."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ class _JobCancellationRegistration:
 
 
 class CancellationToken:
-    """Thread-safe cooperative cancellation with DuckDB interrupt hooks."""
+    """DuckDB 인터럽트 훅을 지원하는 스레드 안전 협력형 취소 토큰이다."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -100,12 +100,10 @@ class CancellationToken:
 
 
 class CancellationRegistry:
-    """Process-local bridge from queue cancellation commands to active jobs.
+    """큐 취소 명령을 실행 중 작업에 연결하는 프로세스 로컬 레지스트리이다.
 
-    A cancellation received before execution leaves a tombstone, so registering
-    the job later immediately cancels its token.  The queue host remains the
-    owner of durable cancellation state and should call :meth:`forget` after a
-    terminal result has been acknowledged.
+    실행 전에 도착한 취소도 tombstone으로 남아 이후 등록된 토큰을 즉시 취소한다. 영속
+    취소 상태는 큐 호스트가 소유하며 종단 결과 확인 뒤 :meth:`forget`을 호출해야 한다.
     """
 
     def __init__(self) -> None:
@@ -152,12 +150,16 @@ class CancellationRegistry:
 
 
 class NullEventSink:
+    """상태 이벤트가 필요 없는 임베딩 환경용 무동작 이벤트 수신기이다."""
+
     def emit(self, _envelope, _status, _details=None) -> None:
         return None
 
 
 @dataclass(slots=True)
 class ExecutionContext:
+    """한 작업 시도의 취소, 예산, 작업 공간과 이벤트 순서를 전달한다."""
+
     job_id: UUID | str | None = None
     attempt: int = 1
     event_sequence_start: int = 0
@@ -177,7 +179,7 @@ class ExecutionContext:
 
 @dataclass(slots=True)
 class RuntimeServices:
-    """Long-lived dependencies owned by an HTTP or queue host."""
+    """HTTP 또는 큐 호스트가 소유하고 주입하는 장기 수명 의존성이다."""
 
     handlers: Mapping[JobType | str, JobHandler] = field(default_factory=dict)
     artifact_store: ArtifactStore | None = None

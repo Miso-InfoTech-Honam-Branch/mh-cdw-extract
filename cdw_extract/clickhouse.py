@@ -1,3 +1,5 @@
+"""ClickHouse HTTP 질의와 Parquet 스트리밍 저장을 지원한다."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,20 +12,28 @@ from .execution_scope import current_execution_resources
 
 
 def http_port(source: dict) -> int:
+    """소스 설정에서 ClickHouse HTTP 포트를 구한다."""
+
     options = source.get("options") or {}
     return int(options.get("httpPort") or source.get("httpPort") or 8123)
 
 
 def http_protocol(source: dict) -> str:
+    """소스 설정에서 ClickHouse HTTP 프로토콜을 구한다."""
+
     options = source.get("options") or {}
     return options.get("httpProtocol") or source.get("httpProtocol") or "http"
 
 
 def clickhouse_url(source: dict) -> str:
+    """ClickHouse HTTP 엔드포인트 URL을 조립한다."""
+
     return f"{http_protocol(source)}://{source.get('host', 'localhost')}:{http_port(source)}"
 
 
 def clickhouse_params(source: dict) -> dict:
+    """ClickHouse HTTP API에 전달할 인증·데이터베이스 매개변수를 만든다."""
+
     params = {
         "database": source.get("database") or "default",
         "user": source.get("username") or "default",
@@ -35,6 +45,8 @@ def clickhouse_params(source: dict) -> dict:
 
 
 def positive_seconds(value: object, default: int) -> int:
+    """값을 양의 초 단위 정수로 정규화하고 실패하면 기본값을 반환한다."""
+
     try:
         seconds = int(value)
     except (TypeError, ValueError):
@@ -43,6 +55,8 @@ def positive_seconds(value: object, default: int) -> int:
 
 
 def request_timeout(source: dict) -> tuple[int, int]:
+    """연결 및 읽기 제한 시간을 requests 형식으로 반환한다."""
+
     options = source.get("options") or {}
     connect_timeout = positive_seconds(
         source.get("connectTimeoutSeconds") or options.get("connectTimeoutSeconds"),
@@ -56,6 +70,8 @@ def request_timeout(source: dict) -> tuple[int, int]:
 
 
 def clickhouse_table_name(source: dict, table: dict) -> str:
+    """스키마와 테이블 식별자를 안전하게 인용해 전체 이름을 만든다."""
+
     schema = table.get("schemaName") or source.get("schemaName") or source.get("database")
     name = table.get("tableName")
     if not name:
@@ -66,6 +82,8 @@ def clickhouse_table_name(source: dict, table: dict) -> str:
 
 
 def clickhouse_select_list(table: dict) -> str:
+    """요청된 열 목록을 인용된 SELECT 절로 변환한다."""
+
     columns = table.get("columns") or []
     if not columns:
         return "*"
@@ -73,6 +91,8 @@ def clickhouse_select_list(table: dict) -> str:
 
 
 def post_query(source: dict, query: str, stream: bool = False) -> requests.Response:
+    """ClickHouse HTTP 질의를 실행하고 성공 응답을 반환한다."""
+
     response = requests.post(
         clickhouse_url(source),
         params=clickhouse_params(source),
@@ -93,6 +113,8 @@ def write_clickhouse_table_parquet(
     *,
     maximum_bytes: int | None = None,
 ) -> int:
+    """ClickHouse 테이블을 Parquet으로 스트리밍하고 원본 행 수를 반환한다."""
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = current_execution_resources()

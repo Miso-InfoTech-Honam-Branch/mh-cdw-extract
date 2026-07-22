@@ -1,8 +1,7 @@
-"""Public API for embedding the CDW extraction engine.
+"""CDW 추출 엔진을 호스트에 내장하기 위한 공개 API를 제공한다.
 
-The queue-neutral contracts and engine are imported eagerly.  Legacy helpers
-remain available through lazy compatibility exports so that importing
-``cdw_extract`` alone does not load filesystem job state or callback delivery.
+큐 중립 계약과 엔진은 즉시 노출하고, 파일 작업 상태나 콜백 전송을 불필요하게
+로딩하지 않도록 기존 호환 함수는 지연 방식으로 제공한다.
 """
 
 from __future__ import annotations

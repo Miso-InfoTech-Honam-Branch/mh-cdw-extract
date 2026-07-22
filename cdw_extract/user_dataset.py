@@ -1,13 +1,16 @@
+"""업로드 파일을 정규화해 안전한 사용자 데이터셋 Parquet으로 게시한다."""
+
 from __future__ import annotations
 
 import csv
 import hashlib
 import json
+import os
 import shutil
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -23,10 +26,14 @@ USER_DATASET_CONVERT = "USER_DATASET_CONVERT"
 
 
 def utc_now() -> str:
+    """UTC 현재 시각을 ISO 8601 문자열로 반환한다."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
 def safe_segment(value: object, field_name: str) -> str:
+    """사용자 데이터셋 경로에 사용할 단일 식별자 조각을 검증한다."""
+
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"{field_name} is required")
@@ -38,10 +45,14 @@ def safe_segment(value: object, field_name: str) -> str:
 
 
 def user_dataset_root(data_root: str | Path) -> Path:
+    """사용자 데이터셋 컬렉션의 루트 경로를 반환한다."""
+
     return Path(data_root) / USER_DATASET_DIR
 
 
 def dataset_file_root(data_root: str | Path, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> Path:
+    """사용자·데이터셋·파일 식별자에 해당하는 정규 저장 경로를 반환한다."""
+
     return (
         user_dataset_root(data_root)
         / safe_segment(user_id, "userId")
@@ -52,14 +63,20 @@ def dataset_file_root(data_root: str | Path, user_id: str, user_dataset_id: str,
 
 
 def dataset_file_parquet_path(data_root: str | Path, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> Path:
+    """게시된 사용자 데이터셋 Parquet 파일의 정규 경로를 반환한다."""
+
     return dataset_file_root(data_root, user_id, user_dataset_id, user_dataset_file_id) / "parquet" / "data.parquet"
 
 
 def dataset_file_manifest_path(data_root: str | Path, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> Path:
+    """사용자 데이터셋 파일 매니페스트의 정규 경로를 반환한다."""
+
     return dataset_file_root(data_root, user_id, user_dataset_id, user_dataset_file_id) / "meta" / "manifest.json"
 
 
 def dataset_file_relative_path(user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> str:
+    """DATA_ROOT 기준 사용자 데이터셋 Parquet 파일 키를 만든다."""
+
     return (
         f"{USER_DATASET_DIR}/{safe_segment(user_id, 'userId')}/"
         f"{safe_segment(user_dataset_id, 'userDatasetId')}/files/"
@@ -68,6 +85,8 @@ def dataset_file_relative_path(user_id: str, user_dataset_id: str, user_dataset_
 
 
 def dataset_file_manifest_relative_path(user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> str:
+    """DATA_ROOT 기준 사용자 데이터셋 매니페스트 키를 만든다."""
+
     return (
         f"{USER_DATASET_DIR}/{safe_segment(user_id, 'userId')}/"
         f"{safe_segment(user_dataset_id, 'userDatasetId')}/files/"
@@ -76,6 +95,8 @@ def dataset_file_manifest_relative_path(user_id: str, user_dataset_id: str, user
 
 
 def load_dataset_file_manifest(data_root: str | Path, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> dict:
+    """게시된 사용자 데이터셋 파일 매니페스트를 읽는다."""
+
     path = dataset_file_manifest_path(data_root, user_id, user_dataset_id, user_dataset_file_id)
     if not path.exists():
         raise FileNotFoundError(f"user dataset file manifest not found: {path}")
@@ -89,6 +110,8 @@ def save_dataset_file_manifest(
     user_dataset_file_id: str,
     manifest: dict,
 ) -> dict:
+    """사용자 데이터셋 매니페스트와 별도 스키마 문서를 저장한다."""
+
     path = dataset_file_manifest_path(data_root, user_id, user_dataset_id, user_dataset_file_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
@@ -100,11 +123,118 @@ def save_dataset_file_manifest(
 
 
 def file_sha256(path: Path) -> str:
+    """파일을 청크 단위로 읽어 SHA-256 체크섬을 계산한다."""
+
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _publish_immutable_dataset_generation(
+    staged_parquet_path: Path,
+    final_file_root: Path,
+    manifest: dict,
+    matches_existing: Callable[[dict, Path, Path, dict], bool],
+    conflict_message: str,
+) -> tuple[dict, bool]:
+    """Parquet과 메타데이터를 완성한 뒤 immutable generation 하나로 원자 게시한다."""
+
+    if not staged_parquet_path.is_file():
+        raise FileNotFoundError(f"staged Parquet file not found: {staged_parquet_path}")
+    staged_file_root = staged_parquet_path.parent.parent
+    final_parquet_path = final_file_root / "parquet" / "data.parquet"
+    final_manifest_path = final_file_root / "meta" / "manifest.json"
+
+    def matching_generation() -> dict | None:
+        try:
+            existing = json.loads(final_manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                return None
+            return (
+                existing
+                if matches_existing(
+                    existing,
+                    final_parquet_path,
+                    staged_parquet_path,
+                    manifest,
+                )
+                else None
+            )
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+
+    if final_file_root.exists():
+        existing = matching_generation()
+        if existing is not None:
+            return existing, False
+        raise FileExistsError(conflict_message)
+
+    final_file_root.parent.mkdir(parents=True, exist_ok=True)
+    publication_staging_root = final_file_root.parent / (
+        f".{final_file_root.name}.{uuid.uuid4().hex}.staging"
+    )
+    try:
+        publication_parquet_path = (
+            publication_staging_root / "parquet" / "data.parquet"
+        )
+        publication_parquet_path.parent.mkdir(parents=True)
+        try:
+            # 같은 filesystem이면 hard link로 대용량 파일 복사를 피하고,
+            # 다른 filesystem이거나 link를 지원하지 않으면 안전하게 복사한다.
+            os.link(staged_parquet_path, publication_parquet_path)
+        except OSError:
+            shutil.copy2(staged_parquet_path, publication_parquet_path)
+
+        # 독자가 Parquet만 있거나 manifest만 있는 중간 상태를 보지 않도록
+        # 모든 파일을 최종 parent의 사설 sibling generation에서 완성한다.
+        publication_meta_root = publication_staging_root / "meta"
+        publication_meta_root.mkdir(parents=True)
+        (publication_meta_root / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (publication_meta_root / "schema.json").write_text(
+            json.dumps(manifest.get("columns") or [], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        try:
+            publication_staging_root.replace(final_file_root)
+        except OSError:
+            # 존재 여부 확인 뒤 다른 at-least-once 실행이 먼저 게시했으면
+            # 호출 경로의 동일 generation 정책을 만족할 때만 멱등 성공으로 본다.
+            existing = matching_generation()
+            if existing is not None:
+                return existing, False
+            raise
+    finally:
+        shutil.rmtree(publication_staging_root, ignore_errors=True)
+
+    # 기존 호출자가 staging root 소멸 여부로 신규 게시를 구분하므로
+    # 최종 rename이 끝난 뒤 원본 private workspace도 정리한다.
+    shutil.rmtree(staged_file_root, ignore_errors=True)
+    if not final_manifest_path.is_file():
+        raise FileNotFoundError(
+            f"published user dataset manifest not found: {final_manifest_path}"
+        )
+    return manifest, True
+
+
+def _extract_result_generation_matches(
+    existing: dict,
+    _final_parquet_path: Path,
+    _staged_parquet_path: Path,
+    requested: dict,
+) -> bool:
+    """기존 extract-result의 idempotency key와 checksum 정책을 적용한다."""
+
+    return (
+        existing.get("idempotencyKey") == requested.get("idempotencyKey")
+        and existing.get("sha256Checksum") == requested.get("sha256Checksum")
+        and existing.get("status") == "SUCCESS"
+    )
 
 
 def publish_dataset_file_artifact(
@@ -115,13 +245,13 @@ def publish_dataset_file_artifact(
     user_dataset_file_id: str,
     manifest: dict,
 ) -> dict:
-    """Atomically publishes Parquet, manifest, and schema as one USER_DATST artifact."""
-    if not staged_parquet_path.exists():
-        raise FileNotFoundError(f"staged Parquet file not found: {staged_parquet_path}")
+    """Parquet, 매니페스트, 스키마를 하나의 USER_DATST 산출물로 원자 게시한다."""
 
-    staged_file_root = staged_parquet_path.parent.parent
-    final_file_root = dataset_file_root(data_root, user_id, user_dataset_id, user_dataset_file_id)
-    final_manifest_path = dataset_file_manifest_path(data_root, user_id, user_dataset_id, user_dataset_file_id)
+    if not staged_parquet_path.is_file():
+        raise FileNotFoundError(f"staged Parquet file not found: {staged_parquet_path}")
+    final_file_root = dataset_file_root(
+        data_root, user_id, user_dataset_id, user_dataset_file_id
+    )
     normalized_manifest = {
         **manifest,
         "userId": safe_segment(user_id, "userId"),
@@ -134,34 +264,67 @@ def publish_dataset_file_artifact(
         "sha256Checksum": file_sha256(staged_parquet_path),
         "status": "SUCCESS",
     }
-
-    if final_file_root.exists():
-        existing = load_dataset_file_manifest(data_root, user_id, user_dataset_id, user_dataset_file_id)
-        same_key = existing.get("idempotencyKey") == normalized_manifest.get("idempotencyKey")
-        same_checksum = existing.get("sha256Checksum") == normalized_manifest.get("sha256Checksum")
-        if same_key and same_checksum and existing.get("status") == "SUCCESS":
-            return existing
-        raise FileExistsError(f"user dataset result target already exists: {final_file_root}")
-
-    staged_meta_root = staged_file_root / "meta"
-    staged_meta_root.mkdir(parents=True, exist_ok=True)
-    (staged_meta_root / "manifest.json").write_text(
-        json.dumps(normalized_manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    published_manifest, _ = _publish_immutable_dataset_generation(
+        staged_parquet_path,
+        final_file_root,
+        normalized_manifest,
+        _extract_result_generation_matches,
+        f"user dataset result target already exists: {final_file_root}",
     )
-    (staged_meta_root / "schema.json").write_text(
-        json.dumps(normalized_manifest.get("columns") or [], ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    return published_manifest
+
+
+def _conversion_generation_matches(
+    existing: dict,
+    final_parquet_path: Path,
+    staged_parquet_path: Path,
+    requested: dict,
+) -> bool:
+    """이미 게시된 변환 결과가 같은 job generation인지 확인한다."""
+
+    if not final_parquet_path.is_file():
+        return False
+    # 동일 job 재시도는 완료 시각이 달라질 수 있지만 나머지 manifest와
+    # 실제 Parquet 바이트는 모두 같아야 한다.
+    existing_identity = {
+        key: value for key, value in existing.items() if key != "createdAt"
+    }
+    requested_identity = {
+        key: value for key, value in requested.items() if key != "createdAt"
+    }
+    return (
+        existing_identity == requested_identity
+        and final_parquet_path.stat().st_size == staged_parquet_path.stat().st_size
+        and file_sha256(final_parquet_path) == file_sha256(staged_parquet_path)
     )
 
-    final_file_root.parent.mkdir(parents=True, exist_ok=True)
-    staged_file_root.replace(final_file_root)
-    if not final_manifest_path.exists():
-        raise FileNotFoundError(f"published user dataset manifest not found: {final_manifest_path}")
-    return normalized_manifest
+
+def _publish_dataset_conversion_generation(
+    staged_parquet_path: Path,
+    data_root: str | Path,
+    user_id: str,
+    user_dataset_id: str,
+    user_dataset_file_id: str,
+    manifest: dict,
+) -> bool:
+    """변환 결과를 immutable generation으로 게시하고 신규 게시 여부를 반환한다."""
+
+    final_file_root = dataset_file_root(
+        data_root, user_id, user_dataset_id, user_dataset_file_id
+    )
+    _, published = _publish_immutable_dataset_generation(
+        staged_parquet_path,
+        final_file_root,
+        manifest,
+        _conversion_generation_matches,
+        f"user dataset conversion target already exists: {final_file_root}",
+    )
+    return published
 
 
 def delete_user_dataset_file(data_root: str | Path, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> dict:
+    """한 사용자 데이터셋 파일의 Parquet과 메타데이터를 함께 삭제한다."""
+
     root = dataset_file_root(data_root, user_id, user_dataset_id, user_dataset_file_id)
     shutil.rmtree(root, ignore_errors=True)
     return {
@@ -173,6 +336,8 @@ def delete_user_dataset_file(data_root: str | Path, user_id: str, user_dataset_i
 
 
 def bool_option(value: object, default: bool = True) -> bool:
+    """레거시 문자열을 포함한 옵션 값을 불리언으로 정규화한다."""
+
     if value is None:
         return default
     if isinstance(value, bool):
@@ -181,6 +346,8 @@ def bool_option(value: object, default: bool = True) -> bool:
 
 
 def normalize_delimiter(value: str | None) -> str:
+    """빈 구분자와 이스케이프된 탭을 실제 CSV 구분자로 변환한다."""
+
     if value is None or value == "":
         return ","
     if value == "\\t":
@@ -189,6 +356,8 @@ def normalize_delimiter(value: str | None) -> str:
 
 
 def normalize_request_options(request: dict | None) -> dict:
+    """중첩·평면 업로드 옵션을 호환 가능한 단일 요청 형태로 합친다."""
+
     request = request or {}
     options = request.get("options") if isinstance(request.get("options"), dict) else {}
     return {
@@ -202,6 +371,8 @@ def normalize_request_options(request: dict | None) -> dict:
 
 
 def upload_suffix(filename: str | None, file_type: str | None = None) -> str:
+    """명시 형식 또는 파일명에서 지원되는 업로드 확장자를 결정한다."""
+
     if file_type:
         normalized = file_type.strip().lower().lstrip(".")
         if normalized in {"csv", "xlsx", "parquet"}:
@@ -215,6 +386,8 @@ def upload_suffix(filename: str | None, file_type: str | None = None) -> str:
 
 
 def copy_upload_file(upload: Any, output: Path) -> None:
+    """업로드 스트림을 처음부터 작업 공간 파일로 복사한다."""
+
     output.parent.mkdir(parents=True, exist_ok=True)
     if hasattr(upload.file, "seek"):
         upload.file.seek(0)
@@ -223,6 +396,8 @@ def copy_upload_file(upload: Any, output: Path) -> None:
 
 
 def unique_headers(values: list[Any]) -> list[str]:
+    """비어 있거나 중복된 헤더를 안정적인 고유 열 이름으로 바꾼다."""
+
     headers: list[str] = []
     seen: dict[str, int] = {}
     for index, value in enumerate(values, start=1):
@@ -235,6 +410,8 @@ def unique_headers(values: list[Any]) -> list[str]:
 
 
 def csv_cell(value: Any) -> Any:
+    """날짜·시간 셀을 CSV에서 손실 없이 읽을 수 있는 문자열로 바꾼다."""
+
     if isinstance(value, datetime):
         return value.isoformat(sep=" ")
     if isinstance(value, date):
@@ -243,12 +420,16 @@ def csv_cell(value: Any) -> Any:
 
 
 def padded_row(row: list[Any], width: int) -> list[Any]:
+    """행을 지정한 열 수에 맞게 NULL로 채우거나 자른다."""
+
     values = list(row or [])
     values.extend([None] * (width - len(values)))
     return values[:width]
 
 
 def generated_headers(width: int) -> list[str]:
+    """헤더 없는 입력을 위한 순번 기반 열 이름을 만든다."""
+
     return [f"column_{index}" for index in range(1, width + 1)]
 
 
@@ -275,6 +456,8 @@ def write_normalized_csv(
     header: bool,
     max_temporary_bytes: int | None = None,
 ) -> None:
+    """가변 폭 행을 디스크에 스풀해 고정 스키마 UTF-8 CSV로 정규화한다."""
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     spool_path = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.rows")
     staged_output_path = output_path.with_name(
@@ -333,6 +516,8 @@ def csv_to_csv(
     header: bool,
     max_temporary_bytes: int | None = None,
 ) -> None:
+    """CSV 입력의 인코딩·구분자·헤더를 정규화된 CSV로 변환한다."""
+
     selected_encoding = encoding or "utf-8-sig"
     with input_path.open("r", newline="", encoding=selected_encoding) as file:
         reader = csv.reader(file, delimiter=delimiter)
@@ -346,6 +531,8 @@ def xlsx_to_csv(
     header: bool = True,
     max_temporary_bytes: int | None = None,
 ) -> None:
+    """선택한 XLSX 시트를 읽기 전용으로 순회해 정규화된 CSV로 변환한다."""
+
     workbook = load_workbook(input_path, read_only=True, data_only=True)
     try:
         if sheet_name:
@@ -361,6 +548,8 @@ def xlsx_to_csv(
 
 
 def source_sql_for_upload(input_path: Path, suffix: str) -> str:
+    """정규화된 업로드 파일에 맞는 DuckDB 읽기 관계를 만든다."""
+
     path = sql_literal(input_path.as_posix())
     if suffix == ".parquet":
         return f"read_parquet({path})"
@@ -374,6 +563,8 @@ def write_parquet_from_upload(
     data_root: str | Path | None = None,
     operation_id: object | None = None,
 ) -> None:
+    """업로드 관계를 DuckDB로 읽어 Parquet 파일로 저장한다."""
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(data_root, "user-dataset-convert", operation_id)
     try:
@@ -391,6 +582,8 @@ def parquet_columns(
     operation_id: object | None = None,
     connection=None,
 ) -> list[dict]:
+    """Parquet의 실제 물리 스키마를 공개 열 메타데이터로 반환한다."""
+
     conn = connection or connect(data_root, "parquet-schema", operation_id)
     try:
         rows = conn.execute(
@@ -417,6 +610,8 @@ def parquet_row_count(
     operation_id: object | None = None,
     connection=None,
 ) -> int:
+    """Parquet 파일의 전체 행 수를 DuckDB로 계산한다."""
+
     conn = connection or connect(data_root, "parquet-count", operation_id)
     try:
         return int(conn.execute("SELECT count(*) FROM read_parquet(?)", [output_path.as_posix()]).fetchone()[0])
@@ -426,10 +621,14 @@ def parquet_row_count(
 
 
 def callback_options(request: dict) -> dict:
+    """사용자 데이터셋 요청에서 콜백 전송 설정을 정규화한다."""
+
     return normalized_callback_options(request)
 
 
 def post_callback(request: dict, payload: dict) -> dict | None:
+    """사용자 데이터셋 변환 결과를 설정된 Boot 콜백으로 전송한다."""
+
     delivery = post_json_callback(
         callback_options(request),
         payload,
@@ -449,6 +648,8 @@ def convert_user_dataset_file_from_path(
     budget: ResourceBudget | None = None,
     workspace: Path | None = None,
 ) -> dict:
+    """작업 공간의 CSV·XLSX·Parquet을 검증된 사용자 데이터셋으로 변환한다."""
+
     request = normalize_request_options(request)
     user_id = safe_segment(request.get("userId"), "userId")
     user_dataset_id = safe_segment(request.get("userDatasetId"), "userDatasetId")
@@ -462,8 +663,7 @@ def convert_user_dataset_file_from_path(
     job_id = str(request.get("jobId") or uuid.uuid4())
     request_id = str(request.get("requestId") or user_dataset_file_id)
     tmp_root = Path(workspace).resolve() if workspace is not None else user_dataset_root(data_root) / "_tmp" / job_id
-    final_parquet_path = dataset_file_parquet_path(data_root, user_id, user_dataset_id, user_dataset_file_id)
-    staged_parquet_path = tmp_root / "parquet" / "data.parquet"
+    staged_parquet_path = tmp_root / "artifact" / "parquet" / "data.parquet"
 
     try:
         if suffix == ".xlsx":
@@ -532,9 +732,16 @@ def convert_user_dataset_file_from_path(
             "status": "SUCCESS",
             "createdAt": utc_now(),
         }
-        final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
-        staged_parquet_path.replace(final_parquet_path)
-        save_dataset_file_manifest(data_root, user_id, user_dataset_id, user_dataset_file_id, manifest)
+        # Parquet, manifest, schema를 사설 staging 세대 안에서 완성한 뒤
+        # 디렉터리 하나를 원자적으로 게시한다. 같은 job의 재전달만 멱등 허용한다.
+        _publish_dataset_conversion_generation(
+            staged_parquet_path,
+            data_root,
+            user_id,
+            user_dataset_id,
+            user_dataset_file_id,
+            manifest,
+        )
         return {
             "requestId": request_id,
             "jobId": job_id,
@@ -553,6 +760,8 @@ def convert_user_dataset_file_from_path(
 
 
 def convert_user_dataset_file(upload: Any, data_root: str | Path, request: dict) -> dict:
+    """HTTP 업로드를 작업 공간에 복사한 뒤 공통 경로 기반 변환을 실행한다."""
+
     request = normalize_request_options(request)
     job_id = str(request.get("jobId") or uuid.uuid4())
     tmp_root = user_dataset_root(data_root) / "_tmp" / job_id

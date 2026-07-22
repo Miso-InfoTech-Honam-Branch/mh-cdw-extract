@@ -1,3 +1,5 @@
+"""분석 질의, 차트, 산출물 API의 엄격한 데이터 계약을 정의한다."""
+
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -8,10 +10,14 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
+    """정의하지 않은 필드를 거부하고 별칭 입력을 허용하는 기본 모델이다."""
+
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class ChartType(str, Enum):
+    """지원하는 분석 차트 유형이다."""
+
     BAR = "BAR"
     PIE = "PIE"
     LINE = "LINE"
@@ -23,6 +29,8 @@ class ChartType(str, Enum):
 
 
 class Aggregation(str, Enum):
+    """분석 측정값에 적용할 집계 연산이다."""
+
     COUNT = "COUNT"
     COUNT_DISTINCT = "COUNT_DISTINCT"
     SUM = "SUM"
@@ -33,6 +41,8 @@ class Aggregation(str, Enum):
 
 
 class TimeGrain(str, Enum):
+    """날짜·시간 값을 묶을 시간 단위이다."""
+
     DAY = "DAY"
     WEEK = "WEEK"
     MONTH = "MONTH"
@@ -41,6 +51,8 @@ class TimeGrain(str, Enum):
 
 
 class FilterOperator(str, Enum):
+    """분석 필터에서 허용하는 비교 연산이다."""
+
     EQ = "EQ"
     NE = "NE"
     GT = "GT"
@@ -55,22 +67,30 @@ class FilterOperator(str, Enum):
 
 
 class SortDirection(str, Enum):
+    """결과 정렬 방향이다."""
+
     ASC = "ASC"
     DESC = "DESC"
 
 
 class NullPolicy(str, Enum):
+    """차트 결과에서 NULL 범주를 다루는 정책이다."""
+
     EXCLUDE = "EXCLUDE"
     INCLUDE = "INCLUDE"
 
 
 class ValueTransform(str, Enum):
+    """집계 후 측정값에 적용할 후처리 방식이다."""
+
     NONE = "NONE"
     PERCENT_OF_TOTAL = "PERCENT_OF_TOTAL"
     RUNNING_TOTAL = "RUNNING_TOTAL"
 
 
 class ExpressionOp(str, Enum):
+    """계산 필드 표현식에서 지원하는 연산자이다."""
+
     COLUMN = "COLUMN"
     LITERAL = "LITERAL"
     ADD = "ADD"
@@ -96,6 +116,8 @@ class ExpressionOp(str, Enum):
 
 
 class CalculatedDataType(str, Enum):
+    """계산 필드가 선언할 수 있는 논리 자료형이다."""
+
     NUMBER = "NUMBER"
     TEXT = "TEXT"
     DATE = "DATE"
@@ -106,6 +128,8 @@ JsonScalar = str | int | float | bool | date | datetime | None
 
 
 class AnalyticsSource(StrictModel):
+    """분석 대상 메타데이터 테이블 또는 사용자 데이터셋을 식별한다."""
+
     source_kind: Literal["USER_DATST", "MTDT_TBL"] = Field(alias="sourceKind")
     user_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="userId")
     user_dataset_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="userDatasetId")
@@ -134,6 +158,8 @@ class AnalyticsSource(StrictModel):
 
 
 class AnalyticsBin(StrictModel):
+    """연속형 값을 일정 간격으로 구간화하는 규칙이다."""
+
     size: Annotated[float, Field(gt=0)]
     offset: float = 0
 
@@ -153,6 +179,8 @@ class AnalyticsBin(StrictModel):
 
 
 class AnalyticsField(StrictModel):
+    """차트 인코딩에 사용할 원본·계산 필드와 변환을 정의한다."""
+
     column: Annotated[str, Field(min_length=1, max_length=255)] | None = None
     derived_field_id: Annotated[str, Field(min_length=1, max_length=100)] | None = Field(
         default=None,
@@ -181,6 +209,8 @@ class AnalyticsField(StrictModel):
 
 
 class AnalyticsEncoding(StrictModel):
+    """차트 유형별 시각 채널에 분석 필드를 배치한다."""
+
     category: AnalyticsField | None = None
     value: AnalyticsField | None = None
     series: AnalyticsField | None = None
@@ -195,6 +225,8 @@ class AnalyticsEncoding(StrictModel):
 
 
 class AnalyticsFilter(StrictModel):
+    """필드와 연산자, 피연산자로 구성된 분석 필터이다."""
+
     column: Annotated[str, Field(min_length=1, max_length=255)] | None = None
     derived_field_id: Annotated[str, Field(min_length=1, max_length=100)] | None = Field(
         default=None,
@@ -238,11 +270,15 @@ class AnalyticsFilter(StrictModel):
 
 
 class AnalyticsSort(StrictModel):
+    """출력 필드에 적용할 정렬 조건이다."""
+
     field: Annotated[str, Field(min_length=1, max_length=255)]
     direction: SortDirection = SortDirection.ASC
 
 
 class CalculatedExpression(StrictModel):
+    """검증 가능한 재귀형 계산 필드 표현식이다."""
+
     op: ExpressionOp
     column: Annotated[str, Field(min_length=1, max_length=255)] | None = None
     value: JsonScalar = None
@@ -256,62 +292,144 @@ class CalculatedExpression(StrictModel):
 
     @model_validator(mode="after")
     def validate_shape(self) -> "CalculatedExpression":
+        self._validate_field_ownership()
+        self._validate_operator_shape()
+        self._validate_branch_ownership()
+        return self
+
+    def _validate_field_ownership(self) -> None:
         if self.op != ExpressionOp.COLUMN and self.column is not None:
             raise ValueError("column is valid only for COLUMN")
         if self.op != ExpressionOp.LITERAL and self.value is not None:
             raise ValueError("value is valid only for LITERAL")
-        if self.op not in {ExpressionOp.DATE_DIFF, ExpressionOp.DATE_PART} and self.unit is not None:
+        if (
+            self.op not in {ExpressionOp.DATE_DIFF, ExpressionOp.DATE_PART}
+            and self.unit is not None
+        ):
             raise ValueError("unit is valid only for DATE_DIFF or DATE_PART")
         if self.op != ExpressionOp.CONCAT and self.separator:
             raise ValueError("separator is valid only for CONCAT")
-        if self.op not in {ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and (self.format or self.on_error):
+        if self.op not in {ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and (
+            self.format or self.on_error
+        ):
             raise ValueError("format and onError are valid only for parse expressions")
-        binary = {
-            ExpressionOp.ADD, ExpressionOp.SUBTRACT, ExpressionOp.MULTIPLY, ExpressionOp.DIVIDE,
-            ExpressionOp.EQ, ExpressionOp.NE, ExpressionOp.GT, ExpressionOp.GTE, ExpressionOp.LT,
-            ExpressionOp.LTE, ExpressionOp.AND, ExpressionOp.OR, ExpressionOp.DATE_DIFF,
+
+    def _validate_operator_shape(self) -> None:
+        validators = {
+            ExpressionOp.COLUMN: self._validate_column_shape,
+            ExpressionOp.LITERAL: self._validate_literal_shape,
+            ExpressionOp.ADD: self._validate_binary_shape,
+            ExpressionOp.SUBTRACT: self._validate_binary_shape,
+            ExpressionOp.MULTIPLY: self._validate_binary_shape,
+            ExpressionOp.DIVIDE: self._validate_binary_shape,
+            ExpressionOp.EQ: self._validate_binary_shape,
+            ExpressionOp.NE: self._validate_binary_shape,
+            ExpressionOp.GT: self._validate_binary_shape,
+            ExpressionOp.GTE: self._validate_binary_shape,
+            ExpressionOp.LT: self._validate_binary_shape,
+            ExpressionOp.LTE: self._validate_binary_shape,
+            ExpressionOp.AND: self._validate_binary_shape,
+            ExpressionOp.OR: self._validate_binary_shape,
+            ExpressionOp.NOT: self._validate_unary_shape,
+            ExpressionOp.COALESCE: self._validate_coalesce_shape,
+            ExpressionOp.CONCAT: self._validate_concat_shape,
+            ExpressionOp.DATE_DIFF: self._validate_date_diff_shape,
+            ExpressionOp.DATE_PART: self._validate_date_part_shape,
+            ExpressionOp.PARSE_DATE: self._validate_parse_date_shape,
+            ExpressionOp.PARSE_NUMBER: self._validate_parse_number_shape,
+            ExpressionOp.CASE: self._validate_case_shape,
         }
-        if self.op == ExpressionOp.COLUMN:
-            if not self.column or self.args or self.branches or self.else_expression is not None:
-                raise ValueError("COLUMN requires only column")
-        elif self.op == ExpressionOp.LITERAL:
-            if "value" not in self.model_fields_set or self.column or self.args or self.branches:
-                raise ValueError("LITERAL requires only value")
-        elif self.op in binary and len(self.args) != 2:
+        validators[self.op]()
+
+    def _validate_column_shape(self) -> None:
+        if (
+            not self.column
+            or self.args
+            or self.branches
+            or self.else_expression is not None
+        ):
+            raise ValueError("COLUMN requires only column")
+
+    def _validate_literal_shape(self) -> None:
+        if (
+            "value" not in self.model_fields_set
+            or self.column
+            or self.args
+            or self.branches
+        ):
+            raise ValueError("LITERAL requires only value")
+
+    def _validate_binary_shape(self) -> None:
+        if len(self.args) != 2:
             raise ValueError(f"{self.op.value} requires exactly two args")
-        elif self.op in {ExpressionOp.NOT, ExpressionOp.DATE_PART, ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and len(self.args) != 1:
+
+    def _validate_unary_shape(self) -> None:
+        if len(self.args) != 1:
             raise ValueError(f"{self.op.value} requires exactly one arg")
-        elif self.op == ExpressionOp.COALESCE and not (2 <= len(self.args) <= 20):
+
+    def _validate_coalesce_shape(self) -> None:
+        if not 2 <= len(self.args) <= 20:
             raise ValueError("COALESCE requires between two and twenty args")
-        elif self.op == ExpressionOp.CONCAT and not (1 <= len(self.args) <= 20):
+
+    def _validate_concat_shape(self) -> None:
+        if not 1 <= len(self.args) <= 20:
             raise ValueError("CONCAT requires between one and twenty args")
-        elif self.op == ExpressionOp.DATE_DIFF and self.unit is None:
+
+    def _validate_date_diff_shape(self) -> None:
+        self._validate_binary_shape()
+        if self.unit is None:
             raise ValueError("DATE_DIFF requires unit")
-        elif self.op == ExpressionOp.DATE_PART and self.unit is None:
+
+    def _validate_date_part_shape(self) -> None:
+        self._validate_unary_shape()
+        if self.unit is None:
             raise ValueError("DATE_PART requires unit")
-        elif self.op == ExpressionOp.PARSE_DATE and self.format not in {
-            "YYMMDD", "YYYYMMDD", "YYYY-MM-DD", "YYYY/MM/DD",
-            "YYYYMMDDHH24MISS", "YYYY-MM-DD HH24:MI:SS",
-        }:
-            raise ValueError("PARSE_DATE requires a supported format")
-        elif self.op == ExpressionOp.PARSE_NUMBER and self.format not in {"PLAIN", "THOUSANDS_COMMA"}:
-            raise ValueError("PARSE_NUMBER requires a supported format")
-        if self.op in {ExpressionOp.PARSE_DATE, ExpressionOp.PARSE_NUMBER} and self.on_error != "NULL":
+
+    def _validate_parse_date_shape(self) -> None:
+        self._validate_parse_shape(
+            {
+                "YYMMDD",
+                "YYYYMMDD",
+                "YYYY-MM-DD",
+                "YYYY/MM/DD",
+                "YYYYMMDDHH24MISS",
+                "YYYY-MM-DD HH24:MI:SS",
+            },
+            "PARSE_DATE requires a supported format",
+        )
+
+    def _validate_parse_number_shape(self) -> None:
+        self._validate_parse_shape(
+            {"PLAIN", "THOUSANDS_COMMA"},
+            "PARSE_NUMBER requires a supported format",
+        )
+
+    def _validate_parse_shape(self, supported_formats: set[str], message: str) -> None:
+        self._validate_unary_shape()
+        if self.format not in supported_formats:
+            raise ValueError(message)
+        if self.on_error != "NULL":
             raise ValueError("parse expressions currently require onError=NULL")
-        elif self.op == ExpressionOp.CASE:
-            if not self.branches or self.else_expression is None or self.args:
-                raise ValueError("CASE requires branches and else")
+
+    def _validate_case_shape(self) -> None:
+        if not self.branches or self.else_expression is None or self.args:
+            raise ValueError("CASE requires branches and else")
+
+    def _validate_branch_ownership(self) -> None:
         if self.op != ExpressionOp.CASE and (self.branches or self.else_expression is not None):
             raise ValueError("branches and else are valid only for CASE")
-        return self
 
 
 class CalculatedCaseBranch(StrictModel):
+    """CASE 계산식의 조건과 결과 한 쌍이다."""
+
     when: CalculatedExpression
     then: CalculatedExpression
 
 
 class AnalyticsCalculatedField(StrictModel):
+    """요청 안에서 재사용할 계산 필드를 정의한다."""
+
     id: Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,99}$")]
     name: Annotated[str, Field(min_length=1, max_length=255)]
     data_type: CalculatedDataType | None = Field(default=None, alias="dataType")
@@ -319,6 +437,8 @@ class AnalyticsCalculatedField(StrictModel):
 
 
 class AnalyticsTopN(StrictModel):
+    """상위 N개 범주와 나머지 묶음 처리 옵션이다."""
+
     enabled: bool = False
     count: Annotated[int, Field(ge=1, le=2000)] = 10
     by: Literal["value"] = "value"
@@ -327,6 +447,8 @@ class AnalyticsTopN(StrictModel):
 
 
 class AnalyticsDrilldown(StrictModel):
+    """계층형 탐색 필드와 현재 드릴다운 수준을 정의한다."""
+
     fields: Annotated[list[AnalyticsField], Field(min_length=1, max_length=8)]
     level: Annotated[int, Field(ge=0, le=7)] = 0
 
@@ -338,11 +460,15 @@ class AnalyticsDrilldown(StrictModel):
 
 
 class ComparisonMode(str, Enum):
+    """계열 또는 이전 기간 비교 방식이다."""
+
     SERIES = "SERIES"
     PREVIOUS_PERIOD = "PREVIOUS_PERIOD"
 
 
 class AnalyticsComparison(StrictModel):
+    """차트 측정값의 비교 기준과 기간 오프셋을 정의한다."""
+
     enabled: bool = False
     mode: ComparisonMode = ComparisonMode.SERIES
     field: AnalyticsField | None = None
@@ -359,12 +485,16 @@ class AnalyticsComparison(StrictModel):
 
 
 class ReferenceLineType(str, Enum):
+    """기준선 값을 계산하는 방식이다."""
+
     CONSTANT = "CONSTANT"
     AVERAGE = "AVERAGE"
     TARGET = "TARGET"
 
 
 class AnalyticsReferenceLine(StrictModel):
+    """차트에 표시할 고정값 또는 통계 기준선 요청이다."""
+
     id: Annotated[str, Field(min_length=1, max_length=100)]
     type: ReferenceLineType
     value: float | None = None
@@ -381,6 +511,8 @@ class AnalyticsReferenceLine(StrictModel):
 
 
 class AnalyticsOptions(StrictModel):
+    """분석 실행의 제한, 자원, NULL 처리 옵션이다."""
+
     null_policy: NullPolicy = Field(default=NullPolicy.EXCLUDE, alias="nullPolicy")
     include_others: bool = Field(default=False, alias="includeOthers")
     others_label: Annotated[str, Field(min_length=1, max_length=100)] = Field(default="Others", alias="othersLabel")
@@ -394,6 +526,8 @@ class AnalyticsOptions(StrictModel):
 
 
 class AnalyticsQueryRequest(StrictModel):
+    """차트 분석 질의의 전체 입력 계약이다."""
+
     schema_version: Literal[1] = Field(alias="schemaVersion")
     request_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="requestId")
     source: AnalyticsSource
@@ -434,12 +568,16 @@ class AnalyticsQueryRequest(StrictModel):
 
 
 class AnalyticsColumn(StrictModel):
+    """분석 결과 열의 이름과 DuckDB 자료형 메타데이터이다."""
+
     key: str
     label: str
     type: str
 
 
 class ResolvedReferenceLine(StrictModel):
+    """실제 값까지 계산된 기준선 결과이다."""
+
     id: str
     type: ReferenceLineType
     value: float
@@ -448,6 +586,8 @@ class ResolvedReferenceLine(StrictModel):
 
 
 class AnalyticsQueryResponse(StrictModel):
+    """분석 행, 열, 기준선, 경고와 실행 메타데이터를 반환한다."""
+
     request_id: str = Field(alias="requestId")
     chart_type: ChartType = Field(alias="chartType")
     source_version: str = Field(alias="sourceVersion")
@@ -462,6 +602,8 @@ class AnalyticsQueryResponse(StrictModel):
 
 
 class AnalyticsDetailRequest(StrictModel):
+    """차트 선택 지점의 원본 상세 행 조회 요청이다."""
+
     schema_version: Literal[1] = Field(alias="schemaVersion")
     request_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="requestId")
     source: AnalyticsSource
@@ -498,6 +640,8 @@ class AnalyticsDetailRequest(StrictModel):
 
 
 class AnalyticsDetailResponse(StrictModel):
+    """상세 행과 페이지 탐색 정보를 담는 응답이다."""
+
     request_id: str = Field(alias="requestId")
     source_version: str = Field(alias="sourceVersion")
     elapsed_ms: int = Field(alias="elapsedMs")
@@ -511,18 +655,24 @@ class AnalyticsDetailResponse(StrictModel):
 
 
 class ArtifactFormat(str, Enum):
+    """분석 산출물로 내보낼 수 있는 파일 형식이다."""
+
     PNG = "PNG"
     PDF = "PDF"
     XLSX = "XLSX"
 
 
 class ArtifactCallback(StrictModel):
+    """분석 산출물 완료 콜백의 URL과 인증 헤더이다."""
+
     url: Annotated[str, Field(min_length=1, max_length=2048)]
     headers: dict[str, Annotated[str, Field(max_length=4096)]] = Field(default_factory=dict)
     timeout_seconds: Annotated[float, Field(gt=0, le=60)] = Field(default=10, alias="timeoutSeconds")
 
 
 class AnalyticsArtifactRequest(StrictModel):
+    """분석 결과 파일 생성 작업의 입력 계약이다."""
+
     schema_version: Literal[1] = Field(alias="schemaVersion")
     job_id: Annotated[str, Field(min_length=1, max_length=100)] = Field(alias="jobId")
     request_id: Annotated[str, Field(min_length=1, max_length=200)] | None = Field(default=None, alias="requestId")
@@ -536,6 +686,8 @@ class AnalyticsArtifactRequest(StrictModel):
 
 
 class AnalyticsArtifactAccepted(StrictModel):
+    """비동기 분석 산출물 작업 수락 응답이다."""
+
     job_id: str = Field(alias="jobId")
     job_type: Literal["ANALYSIS_ARTIFACT"] = Field(default="ANALYSIS_ARTIFACT", alias="jobType")
     request_id: str = Field(alias="requestId")

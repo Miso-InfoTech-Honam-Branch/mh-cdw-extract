@@ -1,3 +1,5 @@
+"""데이터 루트 아래의 안전한 저장 경로와 파일명을 생성한다."""
+
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +20,7 @@ _WINDOWS_RESERVED_NAMES = {
 
 
 def safe_path_segment(value: object, field_name: str) -> str:
-    """Validate one caller-controlled filesystem identity segment."""
+    """호출자가 제공한 파일시스템 식별자 한 조각을 안전하게 검증한다."""
 
     text = str(value or "").strip()
     if not text:
@@ -36,6 +38,8 @@ def safe_path_segment(value: object, field_name: str) -> str:
 
 
 def connection_root(data_root: str | Path, connection_id: str) -> Path:
+    """검증된 연결 식별자에 대응하는 DATA_ROOT 하위 경로를 반환한다."""
+
     root = Path(data_root).expanduser().resolve()
     safe_connection_id = safe_path_segment(connection_id, "connectionId")
     # Materialize the trusted collection directory before resolving children.
@@ -54,14 +58,20 @@ def connection_root(data_root: str | Path, connection_id: str) -> Path:
 
 
 def tables_dir(data_root: str | Path, connection_id: str) -> Path:
+    """연결의 테이블 스냅샷 디렉터리를 반환한다."""
+
     return connection_root(data_root, connection_id) / "tables"
 
 
 def extracts_dir(data_root: str | Path, connection_id: str) -> Path:
+    """연결의 추출 결과 디렉터리를 반환한다."""
+
     return connection_root(data_root, connection_id) / "extracts"
 
 
 def table_file_name(table: dict) -> str:
+    """DB 식별자를 경로에 노출하지 않는 안정적인 Parquet 파일명을 만든다."""
+
     table_id = str(table.get("tableId") or "").strip()
     schema = str(table.get("schemaName") or "").strip()
     name = str(table.get("tableName") or "").strip()

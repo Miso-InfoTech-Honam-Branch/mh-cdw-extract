@@ -1,4 +1,4 @@
-"""Local filesystem ArtifactStore used by the compatibility HTTP adapter."""
+"""호환 HTTP 어댑터가 사용하는 로컬 파일시스템 산출물 저장소이다."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def _format_for_key(key: str) -> str:
 
 
 class LocalArtifactStore:
-    """Store-relative local artifacts with atomic, idempotent publication."""
+    """저장소 상대 키를 사용해 로컬 산출물을 원자적·멱등적으로 게시한다."""
 
     def __init__(self, root: str | Path, store_name: str = "LOCAL") -> None:
         self.root = Path(root).expanduser().resolve()

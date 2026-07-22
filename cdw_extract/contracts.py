@@ -1,8 +1,7 @@
-"""Stable, queue-neutral contracts for embedding the extraction engine.
+"""추출 엔진을 내장하기 위한 안정적인 큐 중립 계약을 정의한다.
 
-The models in this module are transport safe.  In particular, they contain no
-callback URLs, process-local state, or absolute filesystem paths.  Queue and
-HTTP hosts may add their own delivery metadata outside :class:`JobEnvelope`.
+전송 모델에는 콜백 URL, 프로세스 로컬 상태, 절대 파일 경로를 넣지 않는다. 큐와 HTTP
+호스트는 전달 계층 전용 메타데이터를 :class:`JobEnvelope` 바깥에서 관리한다.
 """
 
 from __future__ import annotations
@@ -22,6 +21,8 @@ _MAX_CALLBACK_METRICS_BYTES = 2 * 1024 * 1024
 
 
 class ContractModel(BaseModel):
+    """큐와 HTTP 경계에서 동일한 직렬화 규칙을 사용하는 불변 계약 모델이다."""
+
     model_config = ConfigDict(extra="forbid", populate_by_name=True, frozen=True)
 
     def transport_dict(self) -> dict[str, Any]:
@@ -36,6 +37,8 @@ class ContractModel(BaseModel):
 
 
 class JobType(str, Enum):
+    """실행 엔진이 처리할 수 있는 작업 종류이다."""
+
     EXTRACT = "EXTRACT"
     METADATA_REFRESH = "METADATA_REFRESH"
     DATASET_CONVERT = "DATASET_CONVERT"
@@ -43,6 +46,8 @@ class JobType(str, Enum):
 
 
 class JobStatus(str, Enum):
+    """디스패치부터 종료까지의 표준 작업 상태이다."""
+
     DISPATCH_PENDING = "DISPATCH_PENDING"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -53,6 +58,8 @@ class JobStatus(str, Enum):
 
 
 class JobErrorCategory(str, Enum):
+    """Boot 콜백에서 사용하는 안정적인 오류 분류이다."""
+
     VALIDATION = "VALIDATION"
     DATA = "DATA"
     DEPENDENCY = "DEPENDENCY"
@@ -63,6 +70,8 @@ class JobErrorCategory(str, Enum):
 
 
 class ArtifactStoreType(str, Enum):
+    """산출물이 보관된 논리 저장소 유형이다."""
+
     LOCAL = "LOCAL"
     S3 = "S3"
     MINIO = "MINIO"
@@ -71,6 +80,8 @@ class ArtifactStoreType(str, Enum):
 
 
 class ArtifactFormatType(str, Enum):
+    """산출물 내용의 표준 파일 형식이다."""
+
     PARQUET = "PARQUET"
     CSV = "CSV"
     XLSX = "XLSX"
@@ -81,10 +92,10 @@ class ArtifactFormatType(str, Enum):
 
 
 class ResourceBudget(ContractModel):
-    """Per-job resource ceiling supplied by the dispatching host.
+    """디스패치 호스트가 작업별로 부여하는 자원 상한이다.
 
-    DuckDB settings accept byte quantities, so retaining bytes in the public
-    contract avoids unit ambiguity between Boot, queue workers, and Python.
+    DuckDB 설정과 같은 바이트 단위를 공개 계약에도 유지해 Boot, 큐 워커, Python 사이의
+    단위 해석 차이를 없앤다.
     """
 
     cpu_threads: Annotated[int, Field(ge=1, le=64)] = Field(default=2, alias="cpuThreads")
@@ -121,6 +132,8 @@ class ResourceBudget(ContractModel):
 
 
 class ArtifactDescriptor(ContractModel):
+    """저장소 독립적인 산출물 위치, 무결성, 크기 메타데이터이다."""
+
     store: ArtifactStoreType
     key: Annotated[str, Field(min_length=1, max_length=1000)]
     version: Annotated[str, Field(min_length=1, max_length=255)] | None = None
@@ -169,6 +182,8 @@ class ArtifactDescriptor(ContractModel):
 
 
 class JobError(ContractModel):
+    """작업 결과에 포함되는 안전하고 직렬화 가능한 오류이다."""
+
     code: Annotated[str, Field(min_length=1, max_length=100)]
     message: Annotated[str, Field(min_length=1, max_length=2000)]
     retryable: bool = False
@@ -176,6 +191,8 @@ class JobError(ContractModel):
 
 
 class JobEnvelope(ContractModel):
+    """큐 호스트가 실행 엔진에 전달하는 버전 고정 작업 명령이다."""
+
     schema_version: Literal[2] = Field(default=2, alias="schemaVersion")
     job_id: UUID = Field(alias="jobId")
     job_type: JobType = Field(alias="jobType")
@@ -185,11 +202,10 @@ class JobEnvelope(ContractModel):
 
 
 class CancellationEnvelope(ContractModel):
-    """Queue-neutral, idempotent cancellation command.
+    """큐 구현과 무관한 멱등 취소 명령이다.
 
-    Cancellation delivery is intentionally separate from :class:`JobEnvelope`:
-    it targets an existing execution and therefore has neither ``jobType`` nor
-    a new resource budget.
+    기존 실행을 대상으로 하므로 새 작업을 뜻하는 :class:`JobEnvelope`와 분리하며,
+    ``jobType``이나 새로운 자원 예산을 포함하지 않는다.
     """
 
     schema_version: Literal[2] = Field(default=2, alias="schemaVersion")
@@ -201,6 +217,8 @@ class CancellationEnvelope(ContractModel):
 
 
 class JobResult(ContractModel):
+    """실행 엔진이 반환하는 성공·실패·취소 종단 결과이다."""
+
     schema_version: Literal[2] = Field(default=2, alias="schemaVersion")
     job_id: UUID = Field(alias="jobId")
     job_type: JobType = Field(alias="jobType")
@@ -228,6 +246,8 @@ class JobResult(ContractModel):
 
 
 class JobCallbackError(ContractModel):
+    """Boot 상태 콜백에 노출할 정규화된 오류 정보이다."""
+
     code: Annotated[str, Field(min_length=1, max_length=100)]
     category: JobErrorCategory
     retryable: bool = False
@@ -239,11 +259,10 @@ class JobCallbackError(ContractModel):
 
 
 class JobCallbackEvent(ContractModel):
-    """Boot callback body that a queue host can build from an engine result.
+    """큐 호스트가 엔진 결과로 생성하는 Boot 작업 상태 콜백이다.
 
-    The queue host owns the durable sequence counter.  ``eventId`` is derived
-    from ``jobId`` and ``sequence`` by :meth:`from_result`, which makes a
-    redelivery of the same event idempotent without process-local state.
+    영속 순번은 큐 호스트가 소유한다. :meth:`from_result`가 ``jobId``와 ``sequence``로
+    ``eventId``를 결정하므로 프로세스 로컬 상태 없이 동일 이벤트를 멱등 재전송할 수 있다.
     """
 
     schema_version: Literal[2] = Field(default=2, alias="schemaVersion")

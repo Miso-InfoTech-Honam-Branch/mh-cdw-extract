@@ -1,3 +1,5 @@
+"""파일 기반 작업 상태와 실행 중 취소 제어를 관리한다."""
+
 from __future__ import annotations
 
 import json
@@ -17,15 +19,19 @@ TERMINAL_STATES = {"COMPLETED", "FAILED", "SUCCESS", "CANCELED", "CANCELLED"}
 
 
 class InterruptibleConnection(Protocol):
+    """실행 중 질의를 외부 취소 신호로 중단할 수 있는 연결 계약이다."""
+
     def interrupt(self) -> None: ...
 
 
 class JobCancelled(RuntimeError):
-    """Raised inside a worker when an accepted cancellation must stop the job."""
+    """수락된 취소 요청으로 워커 실행을 중단해야 함을 나타낸다."""
 
 
 @dataclass
 class ExportCancellation:
+    """한 추출 실행의 취소 이벤트와 현재 DuckDB 연결을 연결한다."""
+
     job_id: str
     requested: threading.Event = field(default_factory=threading.Event)
     _connection: InterruptibleConnection | None = None
@@ -119,6 +125,8 @@ def _job_file_lock(data_root: str | Path, job_id: str) -> Iterator[None]:
 
 @contextmanager
 def cancellable_export(job_id: str) -> Iterator[ExportCancellation]:
+    """작업을 프로세스 내 실행 목록에 등록하고 종료 시 안전하게 해제한다."""
+
     normalized = normalize_job_id(job_id)
     cancellation = ExportCancellation(normalized)
     with _running_exports_guard:
@@ -151,10 +159,27 @@ def _running_export(job_id: str) -> ExportCancellation | None:
 
 
 def utc_now() -> str:
+    """UTC 현재 시각을 ISO 8601 문자열로 반환한다."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
+def job_failure_fields(exc: Exception, *, include_error: bool = False) -> dict[str, str]:
+    """예외를 파일 작업 저장소의 안정적인 실패 필드로 변환한다."""
+
+    message = str(exc)
+    fields = {
+        "errorCode": type(exc).__name__,
+        "message": message,
+    }
+    if include_error:
+        fields["error"] = message
+    return fields
+
+
 def normalize_job_id(job_id: str) -> str:
+    """작업 식별자를 정규 UUID 문자열로 검증·변환한다."""
+
     try:
         return str(uuid.UUID(str(job_id)))
     except (TypeError, ValueError) as exc:
@@ -162,14 +187,20 @@ def normalize_job_id(job_id: str) -> str:
 
 
 def jobs_root(data_root: str | Path) -> Path:
+    """파일 기반 작업 저장소의 루트 경로를 반환한다."""
+
     return Path(data_root) / "jobs"
 
 
 def job_dir(data_root: str | Path, job_id: str) -> Path:
+    """검증된 작업 식별자에 대응하는 저장 디렉터리를 반환한다."""
+
     return jobs_root(data_root) / normalize_job_id(job_id)
 
 
 def job_manifest_path(data_root: str | Path, job_id: str) -> Path:
+    """작업 상태 JSON 파일의 정규 경로를 반환한다."""
+
     return job_dir(data_root, job_id) / "job.json"
 
 
@@ -201,6 +232,8 @@ def _write_job_unlocked(data_root: str | Path, job: dict, existing: dict | None 
         and incoming_state is not None
         and incoming_state != previous.get("state")
     )
+    # 완료·실패·취소 중 먼저 커밋된 종단 상태를 보존한다. 늦게 도착한
+    # 워커나 콜백 저장이 이미 확정된 결과를 되돌리지 못하게 하는 경계다.
     if conflicting_terminal:
         return dict(previous)
     accepted_update = job
@@ -222,6 +255,8 @@ def _write_job_unlocked(data_root: str | Path, job: dict, existing: dict | None 
 
 
 def save_job(data_root: str | Path, job: dict) -> dict:
+    """작업 상태를 프로세스·OS 잠금과 원자 교체로 저장한다."""
+
     job_id = normalize_job_id(job["jobId"])
     with _job_lock(job_id):
         with _job_file_lock(data_root, job_id):
@@ -229,7 +264,7 @@ def save_job(data_root: str | Path, job: dict) -> dict:
 
 
 def create_job(data_root: str | Path, job: dict) -> tuple[dict, bool]:
-    """Create a job once; repeated delivery of the same jobId returns the existing job."""
+    """작업을 한 번만 만들고 동일 jobId의 재전달에는 기존 상태를 반환한다."""
     job_id = normalize_job_id(job["jobId"])
     with _job_lock(job_id):
         with _job_file_lock(data_root, job_id):
@@ -240,7 +275,7 @@ def create_job(data_root: str | Path, job: dict) -> tuple[dict, bool]:
 
 
 def update_job(data_root: str | Path, job_id: str, mutator: Callable[[dict], dict]) -> dict:
-    """Atomically load, mutate, and save one job under thread and OS file locks."""
+    """스레드·OS 파일 잠금 안에서 한 작업을 원자적으로 읽고 변경해 저장한다."""
     normalized = normalize_job_id(job_id)
     with _job_lock(normalized):
         with _job_file_lock(data_root, normalized):
@@ -252,6 +287,8 @@ def update_job(data_root: str | Path, job_id: str, mutator: Callable[[dict], dic
 
 
 def load_job(data_root: str | Path, job_id: str) -> dict:
+    """동시 갱신과 직렬화된 상태에서 작업 매니페스트를 읽는다."""
+
     normalized = normalize_job_id(job_id)
     with _job_lock(normalized):
         with _job_file_lock(data_root, normalized):
@@ -268,6 +305,8 @@ def _cancel_response(job: dict, cancel_supported: bool, message: str) -> dict:
 
 
 def cancel_job(data_root: str | Path, job_id: str) -> dict:
+    """추출 작업을 멱등적으로 취소하고 실행 중 연결의 중단 여부를 보고한다."""
+
     normalized = normalize_job_id(job_id)
     with _job_lock(normalized):
         with _job_file_lock(data_root, normalized):
@@ -314,6 +353,8 @@ def cancel_job(data_root: str | Path, job_id: str) -> dict:
 
 
 def ensure_under_data_root(data_root: str | Path, path: str | Path) -> Path:
+    """다운로드 대상이 신뢰된 데이터 루트 아래에 있는지 검증한다."""
+
     root = Path(data_root).expanduser().resolve()
     resolved = Path(path).expanduser().resolve()
     try:
@@ -324,6 +365,8 @@ def ensure_under_data_root(data_root: str | Path, path: str | Path) -> Path:
 
 
 def job_download_file(data_root: str | Path, job_id: str) -> tuple[Path, dict]:
+    """완료된 작업의 검증된 다운로드 경로와 상태를 반환한다."""
+
     job = load_job(data_root, job_id)
     if job.get("state") != "COMPLETED":
         raise ValueError(f"job is not completed: {job.get('state')}")

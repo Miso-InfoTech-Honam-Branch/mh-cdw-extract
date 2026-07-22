@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "new-extract"
+name = "mh-cdw-extract"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,3 +19,9 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["cdw_extract*"]
+
+[tool.ruff.lint]
+extend-select = ["C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 16

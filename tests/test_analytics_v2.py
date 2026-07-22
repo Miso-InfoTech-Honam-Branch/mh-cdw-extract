@@ -28,7 +28,6 @@ from cdw_extract.analytics_models import (
 )
 from cdw_extract.jobs import load_job
 from tests.test_analytics import (
-    DATASET_ID,
     USER_ID,
     create_source,
     request_payload,

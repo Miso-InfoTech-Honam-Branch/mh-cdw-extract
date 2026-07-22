@@ -1,8 +1,7 @@
-"""Callback-free handlers over the current DATA_ROOT implementation.
+"""현재 DATA_ROOT 구현을 콜백 없는 작업 처리기로 연결한다.
 
-These adapters provide a migration bridge.  They call operation-level
-functions only; filesystem job state and callback delivery remain owned by the
-existing FastAPI adapter and are intentionally not used here.
+큐 기반 구조로 이동하는 동안 연산 단위 함수만 재사용하는 호환 계층이다. 파일 작업 상태와
+콜백 전달은 기존 FastAPI 어댑터의 책임으로 남겨 여기서는 의도적으로 사용하지 않는다.
 """
 
 from __future__ import annotations
@@ -330,6 +329,8 @@ def legacy_runtime_services(
     *,
     workspace_root: str | Path | None = None,
 ) -> RuntimeServices:
+    """기존 파일 기반 기능을 큐 중립 엔진용 서비스와 처리기로 묶는다."""
+
     root = Path(data_root).expanduser().resolve()
     return RuntimeServices(
         handlers={
