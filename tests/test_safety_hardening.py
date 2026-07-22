@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -20,7 +21,8 @@ from cdw_extract.errors import PipelineSnapshotMismatch, PipelineSourceSchemaCha
 from cdw_extract.paths import connection_root, table_file_name
 from cdw_extract.query import SourceResolver
 from cdw_extract.refresh import refresh_tables_impl
-from cdw_extract.transforms.runtime import compile_pipeline_request
+from cdw_extract.transforms.compiler import canonical_hash
+from cdw_extract.transforms.runtime import compile_pipeline_request, validate_pipeline_request
 
 
 def _artifact(key: str = "incoming/patients.csv") -> ArtifactDescriptor:
@@ -218,6 +220,77 @@ class LocalArtifactSafetyTest(unittest.TestCase):
 
 
 class ImmutablePipelineContractTest(unittest.TestCase):
+    def test_validation_returns_full_resolved_pipeline_without_mutating_request(self):
+        request, source = _pipeline_request(
+            "(VALUES ('A', 10), ('B', 20)) AS source(category, amount)"
+        )
+        original_request = copy.deepcopy(request)
+
+        with patch(
+            "cdw_extract.transforms.runtime.connect",
+            side_effect=lambda *_args, **_kwargs: duckdb.connect(),
+        ), patch("cdw_extract.transforms.runtime._source_sql", return_value=source):
+            result = validate_pipeline_request("connection-1", request, ".")
+
+        resolved = result["resolvedPipeline"]
+        self.assertEqual(original_request, request)
+        self.assertEqual(2, len(resolved["steps"]))
+        self.assertEqual("OUTPUT", resolved["steps"][-1]["type"])
+        self.assertEqual(
+            ["A", "B"],
+            [item["value"] for item in resolved["steps"][0]["config"]["values"]],
+        )
+        self.assertEqual(canonical_hash(resolved), result["pipelineHash"])
+        self.assertNotEqual(canonical_hash(request["pipeline"]), result["pipelineHash"])
+
+    def test_saved_resolved_pipeline_and_hash_can_be_used_for_execution(self):
+        request, source = _pipeline_request(
+            "(VALUES ('A', 10), ('B', 20)) AS source(category, amount)"
+        )
+        with patch(
+            "cdw_extract.transforms.runtime.connect",
+            side_effect=lambda *_args, **_kwargs: duckdb.connect(),
+        ), patch("cdw_extract.transforms.runtime._source_sql", return_value=source):
+            validation = validate_pipeline_request("connection-1", request, ".")
+
+        execution_request = copy.deepcopy(request)
+        execution_request["pipeline"] = copy.deepcopy(validation["resolvedPipeline"])
+        execution_request["expectedPipelineHash"] = validation["pipelineHash"]
+        execution_request["expectedCompilerVersion"] = validation["compilerVersion"]
+        changed_source = "(VALUES ('A', 10), ('C', 30)) AS source(category, amount)"
+        connection = duckdb.connect()
+        try:
+            with patch("cdw_extract.transforms.runtime._source_sql", return_value=changed_source):
+                compiled = compile_pipeline_request(
+                    "connection-1", execution_request, ".", connection
+                )
+            self.assertEqual(validation["pipelineHash"], compiled.pipeline_hash)
+            self.assertEqual(validation["resolvedPipeline"], compiled.resolved_pipeline)
+            self.assertEqual(
+                [(10, None)],
+                connection.execute(compiled.sql, compiled.parameters).fetchall(),
+            )
+        finally:
+            connection.close()
+
+    def test_fixed_pivot_validation_preserves_supplied_values_and_hash(self):
+        request, source = _pipeline_request(
+            "(VALUES ('A', 10), ('B', 20)) AS source(category, amount)"
+        )
+        request["pipeline"]["steps"][0]["config"]["values"] = [
+            {"valueId": "fixed-a", "value": "A", "label": "Fixed A", "sort": 1}
+        ]
+        expected_pipeline = copy.deepcopy(request["pipeline"])
+
+        with patch(
+            "cdw_extract.transforms.runtime.connect",
+            side_effect=lambda *_args, **_kwargs: duckdb.connect(),
+        ), patch("cdw_extract.transforms.runtime._source_sql", return_value=source):
+            result = validate_pipeline_request("connection-1", request, ".")
+
+        self.assertEqual(expected_pipeline, result["resolvedPipeline"])
+        self.assertEqual(canonical_hash(expected_pipeline), result["pipelineHash"])
+
     def test_automatic_pivot_hash_includes_resolved_output_values(self):
         first_request, first_source = _pipeline_request(
             "(VALUES ('A', 10), ('B', 20)) AS source(category, amount)"

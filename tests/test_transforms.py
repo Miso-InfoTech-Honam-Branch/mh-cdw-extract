@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
 import unittest
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+
 import duckdb
 
 from cdw_extract.transforms.compiler import canonical_hash, compile_pipeline
@@ -16,13 +21,23 @@ SOURCE = [
 
 
 class TransformCompilerTest(unittest.TestCase):
+    def test_resolved_pipeline_hash_matches_the_boot_contract_fixture(self):
+        fixture = json.loads(
+            (Path(__file__).parent / "contracts" / "resolved-pipeline-hash-v1.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            fixture["pipelineHash"],
+            canonical_hash(fixture["resolvedPipeline"]),
+        )
+
     def test_empty_pivot_values_are_discovered_from_all_rows(self):
         pipeline={"pipelineVersion":1,"steps":[
             {"stepId":"pivot","type":"PIVOT","config":{"groupColumnIds":[],"pivotColumnId":"src:department","values":[],"aggregates":[{"aggregateId":"amount","op":"SUM","columnId":"src:amount","label":"합계"}]}},
             {"stepId":"output","type":"OUTPUT","config":{}},
         ]}
         connection=duckdb.connect()
-        resolved,declarative_hash=_resolve_automatic_pivot_values(
+        resolved,resolved_hash=_resolve_automatic_pivot_values(
             connection,
             "(VALUES ('외래', 10, 'p1'), ('입원', 20, 'p2'), ('외래', 30, 'p3')) AS t(department, amount, patient_id)",
             SOURCE,
@@ -31,7 +46,8 @@ class TransformCompilerTest(unittest.TestCase):
         values=resolved["steps"][0]["config"]["values"]
         self.assertEqual(["외래","입원"],sorted(item["value"] for item in values))
         self.assertEqual(2,len({item["valueId"] for item in values}))
-        self.assertEqual(declarative_hash,canonical_hash(pipeline))
+        self.assertEqual(resolved_hash,canonical_hash(resolved))
+        self.assertNotEqual(resolved_hash,canonical_hash(pipeline))
 
     def test_automatic_pivot_uses_code_names_as_column_labels(self):
         source_schema=[
@@ -58,6 +74,67 @@ class TransformCompilerTest(unittest.TestCase):
             resolved,
         )
         self.assertEqual(["신장","체중"],[column.label for column in compiled.output_schema])
+
+    def test_automatic_pivot_normalizes_non_json_duckdb_scalars(self):
+        cases = [
+            ("DECIMAL(10,2)", "CAST(1.20 AS DECIMAL(10,2))", Decimal("1.20"), "1.20"),
+            ("DOUBLE", "CAST(0.1 AS DOUBLE)", 0.1, "0.1"),
+            ("DATE", "DATE '2024-01-02'", date(2024, 1, 2), "2024-01-02"),
+            (
+                "TIMESTAMP",
+                "TIMESTAMP '2024-01-02 03:04:05'",
+                datetime(2024, 1, 2, 3, 4, 5),
+                "2024-01-02T03:04:05",
+            ),
+        ]
+        for data_type, expression, duckdb_value, expected_wire_value in cases:
+            with self.subTest(data_type=data_type):
+                schema = [
+                    ColumnSchema(
+                        "src:pivot_value",
+                        "pivot_value",
+                        "Pivot value",
+                        data_type,
+                        False,
+                        ("src:pivot_value",),
+                    )
+                ]
+                pipeline = {"pipelineVersion": 1, "steps": [
+                    {
+                        "stepId": "pivot",
+                        "type": "PIVOT",
+                        "config": {
+                            "groupColumnIds": [],
+                            "pivotColumnId": "src:pivot_value",
+                            "values": [],
+                            "aggregates": [{"aggregateId": "rows", "op": "COUNT_ROWS"}],
+                        },
+                    },
+                    {"stepId": "output", "type": "OUTPUT", "config": {}},
+                ]}
+                source = f"(SELECT {expression} AS pivot_value) AS source"
+                connection = duckdb.connect()
+                try:
+                    self.assertEqual(
+                        duckdb_value,
+                        connection.execute(f"SELECT pivot_value FROM {source}").fetchone()[0],
+                    )
+                    resolved, resolved_hash = _resolve_automatic_pivot_values(
+                        connection, source, schema, pipeline
+                    )
+                    self.assertEqual(
+                        expected_wire_value,
+                        resolved["steps"][0]["config"]["values"][0]["value"],
+                    )
+                    json.dumps(resolved, ensure_ascii=False)
+                    self.assertEqual(canonical_hash(resolved), resolved_hash)
+                    compiled = compile_pipeline(f"SELECT * FROM {source}", schema, resolved)
+                    self.assertEqual(
+                        [(1,)],
+                        connection.execute(compiled.sql, compiled.parameters).fetchall(),
+                    )
+                finally:
+                    connection.close()
 
     def test_type_normalization_and_numeric_promotion(self):
         self.assertEqual("STRING", normalize_type("varchar"))
@@ -125,6 +202,8 @@ class TransformCompilerTest(unittest.TestCase):
         compiled=compile_pipeline("SELECT * FROM source",SOURCE,pipeline)
         self.assertEqual(2,len(compiled.output_schema))
         self.assertTrue(compiled.output_schema[1].physical_name.startswith("p_"))
+        self.assertEqual(pipeline,compiled.resolved_pipeline)
+        self.assertEqual(canonical_hash(pipeline),compiled.pipeline_hash)
         self.assertEqual(["내과"],compiled.parameters)
 
     def test_pivot_rejects_sum_for_a_text_column_before_execution(self):

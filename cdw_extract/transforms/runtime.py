@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
+from datetime import date, datetime, time
+from decimal import Decimal
 from pathlib import Path
 
 from ..duck import connect, json_safe_rows, quote_ident
@@ -31,6 +34,29 @@ def _pivot_value_id(value: object) -> str:
     return f"auto-{digest}"
 
 
+def _pivot_wire_value(value: object) -> str | int | bool:
+    """Normalize a DuckDB scalar into a lossless JSON contract value."""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "PIVOT_VALUE_NOT_JSON_SERIALIZABLE: automatic PIVOT values must be finite"
+            )
+        # Keep binary floating-point values out of the cross-language JSON hash.
+        # DuckDB will cast this round-trip representation back to the typed pivot column.
+        return repr(value)
+    if isinstance(value, (str, int)):
+        return value
+    raise ValueError(
+        "PIVOT_VALUE_NOT_JSON_SERIALIZABLE: automatic PIVOT values must be JSON scalars"
+    )
+
+
 def _resolve_automatic_pivot_values(
     connection,
     source_sql: str,
@@ -39,8 +65,7 @@ def _resolve_automatic_pivot_values(
     columns: list[dict] | None = None,
     code_mappings: list[dict] | None = None,
 ) -> tuple[dict, str]:
-    """Resolve an empty PIVOT values list from all rows at that pipeline step."""
-    declarative_hash=canonical_hash(pipeline)
+    """Return an isolated, fully resolved pipeline and its canonical hash."""
     resolved=copy.deepcopy(pipeline)
     steps=resolved.get("steps") or []
     for index, step in enumerate(steps):
@@ -85,14 +110,18 @@ def _resolve_automatic_pivot_values(
             raise ValueError(f"PIVOT_TOO_MANY_VALUES: 고유값이 {MAX_PIVOT_VALUES}개를 초과하여 가로로 펼칠 수 없습니다.")
         if not result:
             raise ValueError("PIVOT_NO_VALUES: 가로로 펼칠 값이 없습니다.")
-        config["values"]=[{
-            "valueId":_pivot_value_id(row[0]),
-            "value":row[0],
-            "label":str(row[1]) if len(row)>1 and row[1] is not None and str(row[1]).strip() else str(row[0]),
-            "sort":order,
-        } for order,row in enumerate(result,1)]
+        resolved_values=[]
+        for order,row in enumerate(result,1):
+            wire_value=_pivot_wire_value(row[0])
+            resolved_values.append({
+                "valueId":_pivot_value_id(wire_value),
+                "value":wire_value,
+                "label":str(row[1]) if len(row)>1 and row[1] is not None and str(row[1]).strip() else str(wire_value),
+                "sort":order,
+            })
+        config["values"]=resolved_values
         step["config"]=config
-    return resolved,declarative_hash
+    return resolved,canonical_hash(resolved)
 
 
 def compile_pipeline_request(connection_id: str, request: dict, data_root: str | Path, connection):
@@ -105,7 +134,7 @@ def compile_pipeline_request(connection_id: str, request: dict, data_root: str |
     source_sql=_source_sql(connection_id,data_root,request)
     described=connection.execute(f"DESCRIBE SELECT * FROM {source_sql}").fetchall()
     source_schema=inspect_source_schema(described,request.get("sourceColumns"))
-    pipeline,_declarative_hash=_resolve_automatic_pivot_values(
+    pipeline,resolved_pipeline_hash=_resolve_automatic_pivot_values(
         connection,
         source_sql,
         source_schema,
@@ -114,6 +143,8 @@ def compile_pipeline_request(connection_id: str, request: dict, data_root: str |
         request.get("codeMappings") or [],
     )
     compiled=compile_pipeline(f"SELECT * FROM {source_sql}",source_schema,pipeline)
+    if compiled.pipeline_hash != resolved_pipeline_hash:
+        raise RuntimeError("resolved pipeline hash changed during compilation")
     expected_schema=request.get("expectedSourceSchemaHash")
     actual_schema=compiled.json(False)["sourceSchemaHash"]
     if expected_schema and expected_schema != actual_schema:
@@ -131,7 +162,10 @@ def validate_pipeline_request(connection_id: str, request: dict, data_root: str 
     conn=connect(data_root,"pipeline-validate",request.get("requestId"))
     try:
         compiled=compile_pipeline_request(connection_id,request,data_root,conn)
-        return {**compiled.json(False),"compilerVersion":COMPILER_VERSION}
+        return {
+            **compiled.json(False, include_resolved_pipeline=True),
+            "compilerVersion":COMPILER_VERSION,
+        }
     finally:
         conn.close()
 

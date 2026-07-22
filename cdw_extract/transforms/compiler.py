@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -23,8 +24,9 @@ class CompiledPipeline:
     step_schemas: list[dict]
     warnings: list[dict]
     pipeline_hash: str
+    resolved_pipeline: dict[str, Any]
 
-    def json(self, include_sql: bool = False) -> dict:
+    def json(self, include_sql: bool = False, include_resolved_pipeline: bool = False) -> dict:
         value = {
             "valid": True,
             "pipelineHash": self.pipeline_hash,
@@ -33,6 +35,8 @@ class CompiledPipeline:
             "stepResults": [{key: value for key, value in step.items() if key != "_schema"} for step in self.step_schemas],
             "warnings": self.warnings,
         }
+        if include_resolved_pipeline:
+            value["resolvedPipeline"] = copy.deepcopy(self.resolved_pipeline)
         if include_sql:
             value["sql"] = self.sql
         return value
@@ -67,7 +71,9 @@ class PipelineCompiler:
     def __init__(self, source_sql: str, source_schema: list[ColumnSchema], pipeline: dict):
         self.source_sql = source_sql
         self.schema = list(source_schema)
-        self.pipeline = pipeline or {}
+        # Compile an isolated snapshot. This same snapshot is exposed as the
+        # resolved validation contract and is the sole input to pipelineHash.
+        self.pipeline = copy.deepcopy(pipeline or {})
         self.parameters: list[Any] = []
         self.warnings: list[dict] = []
         self.ctes = [f"{quote_ident('__source')} AS ({source_sql})"]
@@ -114,7 +120,16 @@ class PipelineCompiler:
         if not active or str(active[-1].get("type") or "").upper() != "OUTPUT":
             raise ValueError("the final active step must be OUTPUT")
         sql = f"WITH {', '.join(self.ctes)} SELECT * FROM {self.relation}"
-        return CompiledPipeline(sql, self.parameters, self.schema, self.step_schemas, self.warnings, canonical_hash(self.pipeline))
+        resolved_pipeline = copy.deepcopy(self.pipeline)
+        return CompiledPipeline(
+            sql,
+            self.parameters,
+            self.schema,
+            self.step_schemas,
+            self.warnings,
+            canonical_hash(resolved_pipeline),
+            resolved_pipeline,
+        )
 
     def unsupported(self, step_id: str, config: dict) -> None:
         raise ValueError(f"unsupported pipeline step: {step_id}")
@@ -449,4 +464,7 @@ def compile_pipeline(source_sql: str, source_schema: list[ColumnSchema], pipelin
 
 
 def validate_pipeline(source_sql: str, source_schema: list[ColumnSchema], pipeline: dict) -> dict:
-    return compile_pipeline(source_sql, source_schema, pipeline).json(include_sql=False)
+    return compile_pipeline(source_sql, source_schema, pipeline).json(
+        include_sql=False,
+        include_resolved_pipeline=True,
+    )

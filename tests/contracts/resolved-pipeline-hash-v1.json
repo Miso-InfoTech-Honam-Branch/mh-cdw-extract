@@ -1,0 +1,33 @@
+{
+  "resolvedPipeline": {
+    "pipelineVersion": 1,
+    "steps": [
+      {
+        "stepId": "pivot-vitals",
+        "type": "PIVOT",
+        "name": "활력징후 가로 펼치기",
+        "enabled": true,
+        "config": {
+          "groupColumnIds": ["src:patient-id"],
+          "pivotColumnId": "src:item-code",
+          "values": [
+            {"valueId": "height", "value": "HEIGHT", "label": "신장", "sort": 1},
+            {"valueId": "weight", "value": "WEIGHT", "label": "체중", "sort": 2}
+          ],
+          "aggregates": [
+            {"aggregateId": "value", "op": "MAX", "columnId": "src:item-value", "label": "측정값"}
+          ],
+          "unknownValuePolicy": "IGNORE"
+        }
+      },
+      {
+        "stepId": "output",
+        "type": "OUTPUT",
+        "name": "결과 내보내기",
+        "enabled": true,
+        "config": {}
+      }
+    ]
+  },
+  "pipelineHash": "sha256:4638e40bb165fe662260ce081c890a781cbf3c5ce6d083fe7106303dd79225a0"
+}
