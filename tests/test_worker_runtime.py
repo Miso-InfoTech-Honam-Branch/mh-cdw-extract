@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks, UploadFile
 
 import app as api_app
 import cdw_extract.duck as duck_module
+from cdw_extract.contracts import ResourceBudget
 from cdw_extract.jobs import cancel_job, load_job, save_job
 
 
@@ -242,6 +243,46 @@ class WorkerRuntimeTest(unittest.TestCase):
             recovered_temp = recovered.temp_directory
             recovered.close()
             self.assertFalse(recovered_temp.exists())
+
+    def test_duckdb_weighted_memory_gate_serializes_jobs_that_exceed_host_total(self):
+        environment = {
+            "DUCKDB_TOTAL_THREADS": "2",
+            "DUCKDB_TOTAL_MEMORY_BYTES": str(64 * 1024 * 1024),
+            "DUCKDB_TOTAL_TEMP_BYTES": str(128 * 1024 * 1024),
+            "DUCKDB_MAX_CONCURRENT_OPERATIONS": "2",
+            "DUCKDB_OPERATION_QUEUE_TIMEOUT_SECONDS": "2",
+        }
+        budget = ResourceBudget(
+            cpuThreads=1,
+            memoryBytes=64 * 1024 * 1024,
+            tempBytes=64 * 1024 * 1024,
+        )
+        with tempfile.TemporaryDirectory() as data_root, patch.object(
+            duck_module, "_resource_governor", None
+        ), patch.object(
+            duck_module, "_operation_slots", threading.BoundedSemaphore(2)
+        ), patch.dict(
+            "os.environ", environment
+        ):
+            first = duck_module.connect(data_root, "extract", "memory-heavy-1", budget=budget)
+            second_acquired = threading.Event()
+
+            def open_second() -> None:
+                second = duck_module.connect(data_root, "extract", "memory-heavy-2", budget=budget)
+                second_acquired.set()
+                second.close()
+
+            waiter = threading.Thread(target=open_second)
+            waiter.start()
+            time.sleep(0.1)
+            self.assertFalse(
+                second_acquired.is_set(),
+                "second job bypassed the aggregate memory reservation",
+            )
+            first.close()
+            self.assertTrue(second_acquired.wait(2))
+            waiter.join(2)
+            self.assertFalse(waiter.is_alive())
 
     def test_managed_duckdb_connection_interrupts_a_real_running_query(self):
         with tempfile.TemporaryDirectory() as data_root:

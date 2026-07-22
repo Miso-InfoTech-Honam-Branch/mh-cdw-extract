@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 2,
+  "eventId": "546e3e6c-f765-5613-bca0-9f504ffc6499",
+  "sequence": 10,
+  "jobId": "11111111-1111-1111-1111-111111111111",
+  "queueJobId": "queue-7",
+  "eventType": "JOB_STATUS",
+  "status": "FAILED",
+  "stage": "extract",
+  "progress": null,
+  "attempt": 2,
+  "processedRows": null,
+  "processedBytes": null,
+  "artifacts": [],
+  "error": {
+    "code": "DEADLINE_EXCEEDED",
+    "category": "TIMEOUT",
+    "retryable": true,
+    "message": "Job deadline was exceeded.",
+    "diagnosticRef": "logs/jobs/11111111"
+  }
+}

@@ -17,5 +17,5 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
 ]
 
-[tool.setuptools]
-packages = ["cdw_extract"]
+[tool.setuptools.packages.find]
+include = ["cdw_extract*"]

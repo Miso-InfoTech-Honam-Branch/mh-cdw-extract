@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "jobId": "11111111-1111-1111-1111-111111111111",
+  "jobType": "EXTRACT",
+  "idempotencyKey": "python-fixture-extract-1",
+  "command": {
+    "pipelineVersionId": "22222222-2222-2222-2222-222222222222"
+  },
+  "resourceBudget": {
+    "cpuThreads": 16,
+    "memoryBytes": 34359738368,
+    "tempBytes": 68719476736
+  }
+}

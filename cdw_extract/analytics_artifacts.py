@@ -85,7 +85,9 @@ def _get_render_slots() -> threading.BoundedSemaphore:
 def _artifact_render_slot(
     data_root: str | Path,
     request: AnalyticsArtifactRequest,
-    cancellation: threading.Event,
+    cancellation: object | None,
+    *,
+    check_tombstone: bool = True,
 ) -> Iterator[None]:
     slots = _get_render_slots()
     timeout = _positive_number("ANALYTICS_ARTIFACT_QUEUE_TIMEOUT_SECONDS", 60)
@@ -93,7 +95,12 @@ def _artifact_render_slot(
     acquired = False
     try:
         while not acquired:
-            _check_cancelled(data_root, request, cancellation)
+            _check_cancelled(
+                data_root,
+                request,
+                cancellation,
+                check_tombstone=check_tombstone,
+            )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"timed out waiting {timeout:g} seconds for an artifact render slot")
@@ -341,8 +348,29 @@ def prepare_analysis_artifact_job(
     return _accepted(request)
 
 
-def _check_cancelled(data_root: str | Path, request: AnalyticsArtifactRequest, event: threading.Event) -> None:
-    if event.is_set() or _tombstone_path(data_root, request.user_id, request.analysis_artifact_id).exists():
+def _cancellation_requested(cancellation: object | None) -> bool:
+    if cancellation is None:
+        return False
+    is_set = getattr(cancellation, "is_set", None)
+    if callable(is_set):
+        return bool(is_set())
+    is_cancelled = getattr(cancellation, "is_cancelled", False)
+    return bool(is_cancelled() if callable(is_cancelled) else is_cancelled)
+
+
+def _check_cancelled(
+    data_root: str | Path,
+    request: AnalyticsArtifactRequest,
+    cancellation: object | None,
+    *,
+    check_tombstone: bool = True,
+) -> None:
+    deleted = check_tombstone and _tombstone_path(
+        data_root,
+        request.user_id,
+        request.analysis_artifact_id,
+    ).exists()
+    if _cancellation_requested(cancellation) or deleted:
         raise ArtifactCancelled("Analysis artifact generation was cancelled by deletion.")
 
 
@@ -837,18 +865,30 @@ def _write_xlsx(output_part: Path, preview_png: Path, title: str, rendered: list
 def _render_artifact(
     request: AnalyticsArtifactRequest,
     data_root: str | Path,
-    event: threading.Event,
+    cancellation: object | None,
     staging_root: Path,
+    *,
+    check_tombstone: bool = True,
 ) -> tuple[Path, list[dict], dict]:
     compiled = _compiled_queries(request)
     rendered: list[dict] = []
     source_versions: dict[str, str] = {}
     for item in compiled:
-        _check_cancelled(data_root, request, event)
+        _check_cancelled(
+            data_root,
+            request,
+            cancellation,
+            check_tombstone=check_tombstone,
+        )
         response = run_analytics_query(item["query"], data_root)
         rendered.append({**item, "response": response})
         source_versions[item["chartId"]] = response.source_version
-    _check_cancelled(data_root, request, event)
+    _check_cancelled(
+        data_root,
+        request,
+        cancellation,
+        check_tombstone=check_tombstone,
+    )
 
     title = str(request.spec.get("title") or request.name)
     figure, font_name, render_warnings = _build_figure(title, rendered)
@@ -888,6 +928,75 @@ def _content_type(output_format: ArtifactFormat) -> str:
         ArtifactFormat.PDF: "application/pdf",
         ArtifactFormat.XLSX: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }[output_format]
+
+
+def _combined_source_version(source_versions: dict[str, str]) -> str:
+    unique_source_versions = sorted(set(source_versions.values()))
+    if len(unique_source_versions) == 1:
+        return unique_source_versions[0]
+    return "sha256:" + hashlib.sha256(
+        json.dumps(source_versions, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def render_analysis_artifact_operation(
+    request: AnalyticsArtifactRequest,
+    data_root: str | Path,
+    staging_root: str | Path,
+    *,
+    cancellation: object | None = None,
+    check_tombstone: bool = False,
+) -> dict[str, object]:
+    """Render one artifact without job state mutation or callback delivery.
+
+    The caller owns durable job transitions and publication.  The legacy HTTP
+    runner opts into its deletion tombstone, while queue hosts use only their
+    injected cancellation token.
+    """
+
+    staging = Path(staging_root).expanduser().resolve()
+    staging.mkdir(parents=True, exist_ok=True)
+    with _artifact_render_slot(
+        data_root,
+        request,
+        cancellation,
+        check_tombstone=check_tombstone,
+    ):
+        if check_tombstone:
+            # Keep the historical four-argument call shape for legacy adapter
+            # tests and extensions that replace the low-level renderer.
+            output, rendered, render_meta = _render_artifact(
+                request,
+                data_root,
+                cancellation,
+                staging,
+            )
+        else:
+            output, rendered, render_meta = _render_artifact(
+                request,
+                data_root,
+                cancellation,
+                staging,
+                check_tombstone=False,
+            )
+    _check_cancelled(
+        data_root,
+        request,
+        cancellation,
+        check_tombstone=check_tombstone,
+    )
+    source_versions = dict(render_meta.get("sourceVersions") or {})
+    return {
+        "filePath": output,
+        "fileName": output.name,
+        "format": request.format.value,
+        "contentType": _content_type(request.format),
+        "sizeBytes": output.stat().st_size,
+        "sha256Checksum": file_sha256(output),
+        "sourceVersion": _combined_source_version(source_versions),
+        "chartCount": len(rendered),
+        **render_meta,
+    }
 
 
 def _callback_payload(request: AnalyticsArtifactRequest, status: str, manifest: dict | None = None, exc: Exception | None = None) -> dict:
@@ -1011,20 +1120,15 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
     shutil.rmtree(staging_root, ignore_errors=True)
     staging_root.mkdir(parents=True, exist_ok=False)
     try:
-        with _artifact_render_slot(data_root, request, event):
-            output, rendered, render_meta = _render_artifact(request, data_root, event, staging_root)
-        _check_cancelled(data_root, request, event)
-        file_name = output.name
-        source_versions = render_meta.get("sourceVersions") or {}
-        unique_source_versions = sorted(set(source_versions.values()))
-        source_version = (
-            unique_source_versions[0]
-            if len(unique_source_versions) == 1
-            else "sha256:"
-            + hashlib.sha256(
-                json.dumps(source_versions, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
+        operation = render_analysis_artifact_operation(
+            request,
+            data_root,
+            staging_root,
+            cancellation=event,
+            check_tombstone=True,
         )
+        output = Path(operation["filePath"])
+        file_name = str(operation["fileName"])
         manifest = {
             "schemaVersion": 1,
             "jobId": request.job_id,
@@ -1038,12 +1142,14 @@ def run_analysis_artifact_job(request: AnalyticsArtifactRequest, data_root: str 
             "status": READY,
             "fileName": file_name,
             "relativePath": artifact_relative_path(request.user_id, request.analysis_artifact_id, file_name),
-            "contentType": _content_type(request.format),
-            "sizeBytes": output.stat().st_size,
-            "sha256Checksum": file_sha256(output),
-            "sourceVersion": source_version,
-            "chartCount": len(rendered),
-            **render_meta,
+            "contentType": operation["contentType"],
+            "sizeBytes": operation["sizeBytes"],
+            "sha256Checksum": operation["sha256Checksum"],
+            "sourceVersion": operation["sourceVersion"],
+            "chartCount": operation["chartCount"],
+            "fontName": operation["fontName"],
+            "renderWarnings": operation["renderWarnings"],
+            "sourceVersions": operation["sourceVersions"],
             "createdAt": utc_now(),
         }
         _atomic_json(staging_root / "meta" / "manifest.json", manifest)

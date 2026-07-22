@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .duck import parquet_scan, quote_ident, sql_literal
 from .manifest import load_connection_manifest
+from .paths import connection_root
 from .user_dataset import (
     dataset_file_parquet_path,
     load_dataset_file_manifest,
@@ -62,7 +63,21 @@ def table_ref_from_manifest(manifest: dict, table: dict) -> dict:
 
 def connection_table_path(data_root: str | Path, connection_id: str, manifest: dict, table: dict) -> Path:
     item = table_ref_from_manifest(manifest, table)
-    return Path(data_root) / "connections" / connection_id / item["path"]
+    raw_path = item.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("connection manifest table path is required")
+    relative = Path(raw_path.strip())
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("connection manifest table path must be relative and must not traverse parents")
+    if any(character in raw_path for character in "*?[]{}"):
+        raise ValueError("connection manifest table path must not contain glob patterns")
+
+    root = connection_root(data_root, connection_id)
+    tables_root = (root / "tables").resolve()
+    candidate = (root / relative).resolve()
+    if not tables_root.is_relative_to(root) or not candidate.is_relative_to(tables_root):
+        raise ValueError("connection manifest table path must remain beneath its tables directory")
+    return candidate
 
 
 class SourceResolver:
@@ -75,6 +90,12 @@ class SourceResolver:
     def connection_manifest(self) -> dict:
         if self._connection_manifest is None:
             self._connection_manifest = load_connection_manifest(self.connection_id, self.data_root)
+            manifest_connection_id = self._connection_manifest.get("connectionId")
+            if (
+                manifest_connection_id is not None
+                and str(manifest_connection_id) != self.connection_id
+            ):
+                raise ValueError("connection manifest identity does not match connectionId")
         return self._connection_manifest
 
     def user_dataset_file_manifest(self, user_id: str, user_dataset_id: str, user_dataset_file_id: str) -> dict:

@@ -4,6 +4,8 @@ Python function-first extraction module with a thin FastAPI test wrapper.
 
 프로젝트 책임, 변경 위치와 코드 작성 규칙은 [개발 가이드](docs/DEVELOPMENT.md)를 먼저 확인하세요.
 다른 작업 실행 서비스에 탑재할 때의 경계는 [모듈 내장 가이드](docs/EMBEDDING.md)에 정리되어 있습니다.
+Boot의 queue 작업 프로젝트에 연결할 때는 [Queue 모듈 연동 가이드](docs/QUEUE_MODULE_V2.md)와
+[Queue host 운영 체크리스트](docs/QUEUE_HOST_CHECKLIST_V2.md)를 함께 확인하세요.
 
 ## Install
 
@@ -223,7 +225,7 @@ ${DATA_ROOT}/user-datasets/{userId}/{userDatasetId}/files/{userDatasetFileId}/pa
 Refreshed DB source tables are stored under:
 
 ```text
-${DATA_ROOT}/connections/{connectionId}/tables/*.parquet
+${DATA_ROOT}/connections/{connectionId}/tables/{snapshotId}/*.parquet
 ${DATA_ROOT}/connections/{connectionId}/manifest.json
 ```
 
@@ -451,7 +453,7 @@ stability. A request waits up to
 slot, checking cancellation while queued; a timeout finishes the job as
 `FAILED` and is reported through the normal terminal callback.
 
-Worker storage does not need to be shared with Boot. Boot proxies:
+In legacy direct-worker mode, worker storage does not need to be shared with Boot because Boot proxies:
 
 ```text
 GET    /api/v1/analytics/artifacts/{userId}/{analysisArtifactId}/download

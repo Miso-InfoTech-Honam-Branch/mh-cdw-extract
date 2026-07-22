@@ -175,6 +175,20 @@ def _fetch_with_timeout(
         timer.cancel()
 
 
+def _apply_connection_limits(connection, options) -> None:
+    """Apply request preferences without escaping the governor's lease."""
+
+    requested_memory_bytes = options.memory_limit_mb * 1024 * 1024
+    leased_memory_bytes = int(
+        getattr(connection, "effective_memory_bytes", requested_memory_bytes)
+    )
+    leased_threads = int(getattr(connection, "effective_threads", options.threads))
+    memory_bytes = min(requested_memory_bytes, leased_memory_bytes)
+    threads = min(options.threads, leased_threads)
+    connection.execute(f"SET memory_limit='{memory_bytes}B'")
+    connection.execute(f"SET threads={threads}")
+
+
 def run_analytics_query(
     request: AnalyticsQueryRequest,
     data_root: str | Path,
@@ -184,8 +198,7 @@ def run_analytics_query(
     connection = connect(data_root, "analytics", request.request_id)
     try:
         options = request.options
-        connection.execute(f"SET memory_limit='{options.memory_limit_mb}MB'")
-        connection.execute(f"SET threads={options.threads}")
+        _apply_connection_limits(connection, options)
         connection.execute("SET preserve_insertion_order=false")
         source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(
@@ -296,8 +309,7 @@ def run_analytics_detail(
     connection = connect(data_root, "analytics-detail", request.request_id)
     try:
         options = request.options
-        connection.execute(f"SET memory_limit='{options.memory_limit_mb}MB'")
-        connection.execute(f"SET threads={options.threads}")
+        _apply_connection_limits(connection, options)
         connection.execute("SET preserve_insertion_order=false")
         source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(

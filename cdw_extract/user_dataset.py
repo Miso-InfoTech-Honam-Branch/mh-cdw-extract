@@ -12,6 +12,8 @@ from typing import Any
 import requests
 
 from .callback import callback_options as normalized_callback_options, post_json_callback
+from .contracts import ResourceBudget
+from .errors import ResourceLimitExceeded
 from openpyxl import load_workbook
 
 from .duck import connect, sql_literal
@@ -250,44 +252,100 @@ def generated_headers(width: int) -> list[str]:
     return [f"column_{index}" for index in range(1, width + 1)]
 
 
-def write_normalized_csv(rows: Any, output_path: Path, header: bool) -> None:
-    materialized_rows: list[list[Any]] = []
-    first_row = None
-    max_width = 0
-    for row in rows:
-        if row and any(value is not None and value != "" for value in row):
-            first_row = list(row)
-            materialized_rows.append(first_row)
-            max_width = max(max_width, len(first_row))
-            break
-    if first_row is None:
-        raise ValueError("file has no rows")
+class _ByteBudgetWriter:
+    def __init__(self, stream: Any, maximum_bytes: int | None, used_bytes: int = 0) -> None:
+        self.stream = stream
+        self.maximum_bytes = maximum_bytes
+        self.used_bytes = used_bytes
 
-    for row in rows:
-        values = list(row or [])
-        materialized_rows.append(values)
-        max_width = max(max_width, len(values))
+    def write(self, value: str) -> int:
+        encoded_size = len(value.encode("utf-8"))
+        if self.maximum_bytes is not None and self.used_bytes + encoded_size > self.maximum_bytes:
+            raise ResourceLimitExceeded(
+                f"CSV/XLSX normalization exceeded resourceBudget.tempBytes={self.maximum_bytes}."
+            )
+        written = self.stream.write(value)
+        self.used_bytes += encoded_size
+        return written
 
-    headers = unique_headers(padded_row(first_row, max_width)) if header else generated_headers(max_width)
+
+def write_normalized_csv(
+    rows: Any,
+    output_path: Path,
+    header: bool,
+    max_temporary_bytes: int | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(headers)
-        if not header:
-            writer.writerow([csv_cell(value) for value in padded_row(first_row, len(headers))])
-        data_rows = materialized_rows[1:] if header else materialized_rows[1:]
-        for row in data_rows:
-            writer.writerow([csv_cell(value) for value in padded_row(list(row or []), len(headers))])
+    spool_path = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.rows")
+    staged_output_path = output_path.with_name(
+        f".{output_path.name}.{uuid.uuid4().hex}.normalized"
+    )
+    first_row: list[Any] | None = None
+    max_width = 0
+    try:
+        # The widest row determines the final header width.  Spool rows to
+        # disk so a large CSV/XLSX never has to be retained in Python memory.
+        with spool_path.open("w", newline="", encoding="utf-8") as spool:
+            spool_budget = _ByteBudgetWriter(spool, max_temporary_bytes)
+            spool_writer = csv.writer(spool_budget)
+            for row in rows:
+                values = list(row or [])
+                if first_row is None:
+                    if not values or not any(value is not None and value != "" for value in values):
+                        continue
+                    first_row = values
+                max_width = max(max_width, len(values))
+                spool_writer.writerow([csv_cell(value) for value in values])
+            spooled_bytes = spool_budget.used_bytes
+
+        if first_row is None:
+            raise ValueError("file has no rows")
+
+        headers = (
+            unique_headers(padded_row(first_row, max_width))
+            if header
+            else generated_headers(max_width)
+        )
+        with spool_path.open("r", newline="", encoding="utf-8") as spool, staged_output_path.open(
+            "w", newline="", encoding="utf-8"
+        ) as output:
+            reader = csv.reader(spool)
+            output_budget = _ByteBudgetWriter(output, max_temporary_bytes, spooled_bytes)
+            writer = csv.writer(output_budget)
+            writer.writerow(headers)
+            for index, row in enumerate(reader):
+                if header and index == 0:
+                    continue
+                writer.writerow(padded_row(row, max_width))
+        # A failed budget check or encoding/write error must never leave a
+        # partial normalized file at the caller-visible staging path.
+        staged_output_path.replace(output_path)
+    finally:
+        spool_path.unlink(missing_ok=True)
+        staged_output_path.unlink(missing_ok=True)
 
 
-def csv_to_csv(input_path: Path, output_path: Path, delimiter: str, encoding: str | None, header: bool) -> None:
+def csv_to_csv(
+    input_path: Path,
+    output_path: Path,
+    delimiter: str,
+    encoding: str | None,
+    header: bool,
+    max_temporary_bytes: int | None = None,
+) -> None:
     selected_encoding = encoding or "utf-8-sig"
     with input_path.open("r", newline="", encoding=selected_encoding) as file:
         reader = csv.reader(file, delimiter=delimiter)
-        write_normalized_csv(reader, output_path, header)
+        write_normalized_csv(reader, output_path, header, max_temporary_bytes)
 
 
-def xlsx_to_csv(input_path: Path, output_path: Path, sheet_name: str | None = None, header: bool = True) -> None:
+def xlsx_to_csv(
+    input_path: Path,
+    output_path: Path,
+    sheet_name: str | None = None,
+    header: bool = True,
+    max_temporary_bytes: int | None = None,
+) -> None:
     workbook = load_workbook(input_path, read_only=True, data_only=True)
     try:
         if sheet_name:
@@ -297,7 +355,7 @@ def xlsx_to_csv(input_path: Path, output_path: Path, sheet_name: str | None = No
         else:
             sheet = workbook[workbook.sheetnames[0]]
         rows = sheet.iter_rows(values_only=True)
-        write_normalized_csv(rows, output_path, header)
+        write_normalized_csv(rows, output_path, header, max_temporary_bytes)
     finally:
         workbook.close()
 
@@ -383,7 +441,14 @@ def post_callback(request: dict, payload: dict) -> dict | None:
     return delivery
 
 
-def convert_user_dataset_file_from_path(input_upload_path: Path, data_root: str | Path, request: dict) -> dict:
+def convert_user_dataset_file_from_path(
+    input_upload_path: Path,
+    data_root: str | Path,
+    request: dict,
+    *,
+    budget: ResourceBudget | None = None,
+    workspace: Path | None = None,
+) -> dict:
     request = normalize_request_options(request)
     user_id = safe_segment(request.get("userId"), "userId")
     user_dataset_id = safe_segment(request.get("userDatasetId"), "userDatasetId")
@@ -396,19 +461,32 @@ def convert_user_dataset_file_from_path(input_upload_path: Path, data_root: str 
     sheet_name = request.get("sheetName")
     job_id = str(request.get("jobId") or uuid.uuid4())
     request_id = str(request.get("requestId") or user_dataset_file_id)
-    tmp_root = user_dataset_root(data_root) / "_tmp" / job_id
+    tmp_root = Path(workspace).resolve() if workspace is not None else user_dataset_root(data_root) / "_tmp" / job_id
     final_parquet_path = dataset_file_parquet_path(data_root, user_id, user_dataset_id, user_dataset_file_id)
     staged_parquet_path = tmp_root / "parquet" / "data.parquet"
 
     try:
         if suffix == ".xlsx":
             csv_path = tmp_root / "upload.csv"
-            xlsx_to_csv(input_upload_path, csv_path, sheet_name=sheet_name, header=header)
+            xlsx_to_csv(
+                input_upload_path,
+                csv_path,
+                sheet_name=sheet_name,
+                header=header,
+                max_temporary_bytes=budget.temp_bytes if budget is not None else None,
+            )
             input_path = csv_path
             input_suffix = ".csv"
         elif suffix == ".csv":
             csv_path = tmp_root / "upload.normalized.csv"
-            csv_to_csv(input_upload_path, csv_path, delimiter=delimiter, encoding=encoding, header=header)
+            csv_to_csv(
+                input_upload_path,
+                csv_path,
+                delimiter=delimiter,
+                encoding=encoding,
+                header=header,
+                max_temporary_bytes=budget.temp_bytes if budget is not None else None,
+            )
             input_path = csv_path
             input_suffix = ".csv"
         else:
@@ -417,6 +495,23 @@ def convert_user_dataset_file_from_path(input_upload_path: Path, data_root: str 
 
         write_parquet_from_upload(input_path, input_suffix, staged_parquet_path, data_root, job_id)
         row_count = parquet_row_count(staged_parquet_path, data_root, job_id)
+        if budget is not None and budget.row_limit is not None and row_count > budget.row_limit:
+            raise ResourceLimitExceeded(
+                f"User dataset output exceeded resourceBudget.rowLimit={budget.row_limit}."
+            )
+        output_size = staged_parquet_path.stat().st_size
+        if budget is not None and budget.output_bytes is not None and output_size > budget.output_bytes:
+            raise ResourceLimitExceeded(
+                f"User dataset output exceeded resourceBudget.outputBytes={budget.output_bytes}."
+            )
+        if budget is not None:
+            temporary_size = sum(
+                path.stat().st_size for path in tmp_root.rglob("*") if path.is_file()
+            )
+            if temporary_size > budget.temp_bytes:
+                raise ResourceLimitExceeded(
+                    f"User dataset staging exceeded resourceBudget.tempBytes={budget.temp_bytes}."
+                )
         columns = parquet_columns(staged_parquet_path, data_root, job_id)
         manifest = {
             "requestId": request_id,

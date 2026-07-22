@@ -5,8 +5,16 @@ import hashlib
 from pathlib import Path
 
 from ..duck import connect, json_safe_rows, quote_ident
+from ..errors import (
+    PipelineCompilerVersionMismatch,
+    PipelineSnapshotMismatch,
+    PipelineSourceSchemaChanged,
+)
 from ..query import SourceResolver, projection_with_mappings_sql, source_from_sql, source_with_code_mappings_sql, single_table_alias
-from .compiler import MAX_PIVOT_VALUES, CompiledPipeline, canonical_hash, compile_pipeline, inspect_source_schema
+from .compiler import MAX_PIVOT_VALUES, canonical_hash, compile_pipeline, inspect_source_schema
+
+
+COMPILER_VERSION = "1"
 
 
 def _source_sql(connection_id: str, data_root: str | Path, request: dict) -> str:
@@ -88,10 +96,16 @@ def _resolve_automatic_pivot_values(
 
 
 def compile_pipeline_request(connection_id: str, request: dict, data_root: str | Path, connection):
+    expected_compiler = request.get("expectedCompilerVersion")
+    if expected_compiler is not None and str(expected_compiler) != COMPILER_VERSION:
+        raise PipelineCompilerVersionMismatch(
+            "PIPELINE_COMPILER_VERSION_MISMATCH: the saved pipeline requires compiler "
+            f"{expected_compiler}, but this worker provides {COMPILER_VERSION}."
+        )
     source_sql=_source_sql(connection_id,data_root,request)
     described=connection.execute(f"DESCRIBE SELECT * FROM {source_sql}").fetchall()
     source_schema=inspect_source_schema(described,request.get("sourceColumns"))
-    pipeline,declarative_hash=_resolve_automatic_pivot_values(
+    pipeline,_declarative_hash=_resolve_automatic_pivot_values(
         connection,
         source_sql,
         source_schema,
@@ -100,15 +114,16 @@ def compile_pipeline_request(connection_id: str, request: dict, data_root: str |
         request.get("codeMappings") or [],
     )
     compiled=compile_pipeline(f"SELECT * FROM {source_sql}",source_schema,pipeline)
-    if compiled.pipeline_hash!=declarative_hash:
-        compiled=CompiledPipeline(compiled.sql,compiled.parameters,compiled.output_schema,compiled.step_schemas,compiled.warnings,declarative_hash)
     expected_schema=request.get("expectedSourceSchemaHash")
     actual_schema=compiled.json(False)["sourceSchemaHash"]
     if expected_schema and expected_schema != actual_schema:
-        raise ValueError("PIPELINE_SOURCE_SCHEMA_CHANGED: 원본 항목의 형식이 바뀌었습니다. 양식을 다시 확인해 주세요.")
+        raise PipelineSourceSchemaChanged(
+            "PIPELINE_SOURCE_SCHEMA_CHANGED: 원본 항목의 형식이 바뀌었습니다. "
+            "양식을 다시 확인해 주세요."
+        )
     expected_pipeline=request.get("expectedPipelineHash")
     if expected_pipeline and expected_pipeline != compiled.pipeline_hash:
-        raise ValueError("PIPELINE_SNAPSHOT_MISMATCH: 저장된 변환 단계가 검증본과 다릅니다.")
+        raise PipelineSnapshotMismatch("PIPELINE_SNAPSHOT_MISMATCH: 저장된 변환 단계가 검증본과 다릅니다.")
     return compiled
 
 
@@ -116,7 +131,7 @@ def validate_pipeline_request(connection_id: str, request: dict, data_root: str 
     conn=connect(data_root,"pipeline-validate",request.get("requestId"))
     try:
         compiled=compile_pipeline_request(connection_id,request,data_root,conn)
-        return {**compiled.json(False),"compilerVersion":"1"}
+        return {**compiled.json(False),"compilerVersion":COMPILER_VERSION}
     finally:
         conn.close()
 
@@ -130,6 +145,6 @@ def preview_pipeline(connection_id: str, request: dict, data_root: str | Path) -
         result=conn.execute(f"SELECT * FROM ({compiled.sql}) AS __preview LIMIT {limit}",compiled.parameters)
         names=[item[0] for item in result.description or []]
         rows=[dict(zip(names,row)) for row in result.fetchall()]
-        return {**compiled.json(False),"compilerVersion":"1","limit":limit,"rowCount":len(rows),"columns":[item.json() for item in compiled.output_schema],"rows":json_safe_rows(rows)}
+        return {**compiled.json(False),"compilerVersion":COMPILER_VERSION,"limit":limit,"rowCount":len(rows),"columns":[item.json() for item in compiled.output_schema],"rows":json_safe_rows(rows)}
     finally:
         conn.close()

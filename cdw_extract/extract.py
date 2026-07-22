@@ -4,7 +4,9 @@ import shutil
 import uuid
 from pathlib import Path
 
-from .duck import connect
+from .contracts import ResourceBudget
+from .duck import connect, sql_literal
+from .errors import ResourceLimitExceeded
 from .jobs import (
     ExportCancellation,
     JobCancelled,
@@ -143,6 +145,7 @@ def execute_extract(
     data_root: str | Path,
     job_id: str,
     cancellation: ExportCancellation | None = None,
+    budget: ResourceBudget | None = None,
 ) -> dict:
     output_format = validate_extract_request(connection_id, request)
     target = normalize_result_target(request)
@@ -178,27 +181,65 @@ def execute_extract(
             cancellation.attach(conn)
             cancellation.raise_if_requested()
         copy_format = "CSV, HEADER true" if output_format == "csv" else "PARQUET"
+        copied_row_count: int | None = None
         if request.get("pipeline"):
             compiled = compile_pipeline_request(connection_id, request, data_root, conn)
-            conn.execute(
-                f"CREATE TEMP TABLE __pipeline_result AS {compiled.sql}",
+            copy_sql = compiled.sql
+            if budget is not None and budget.row_limit is not None:
+                copy_sql = (
+                    f"SELECT * FROM ({copy_sql}) AS __budget_limited "
+                    f"LIMIT {budget.row_limit + 1}"
+                )
+            copy_result = conn.execute(
+                f"COPY ({copy_sql}) TO {sql_literal(staged_output.as_posix())} (FORMAT {copy_format})",
                 compiled.parameters,
-            )
-            conn.execute(
-                f"COPY __pipeline_result TO ? (FORMAT {copy_format})",
-                [staged_output.as_posix()],
-            )
+            ).fetchone()
+            if copy_result and copy_result[0] is not None:
+                copied_row_count = int(copy_result[0])
         else:
             sql = final_query(connection_id, data_root, request)
-            conn.execute(f"COPY ({sql}) TO ? (FORMAT {copy_format})", [staged_output.as_posix()])
+            if budget is not None and budget.row_limit is not None:
+                sql = (
+                    f"SELECT * FROM ({sql}) AS __budget_limited "
+                    f"LIMIT {budget.row_limit + 1}"
+                )
+            copy_result = conn.execute(
+                f"COPY ({sql}) TO ? (FORMAT {copy_format})",
+                [staged_output.as_posix()],
+            ).fetchone()
+            if copy_result and copy_result[0] is not None:
+                copied_row_count = int(copy_result[0])
+        if (
+            budget is not None
+            and budget.row_limit is not None
+            and copied_row_count is not None
+            and copied_row_count > budget.row_limit
+        ):
+            raise ResourceLimitExceeded(
+                f"Extract output exceeded resourceBudget.rowLimit={budget.row_limit}."
+            )
+        if (
+            budget is not None
+            and budget.output_bytes is not None
+            and staged_output.stat().st_size > budget.output_bytes
+        ):
+            raise ResourceLimitExceeded(
+                f"Extract output exceeded resourceBudget.outputBytes={budget.output_bytes}."
+            )
         if cancellation is not None:
             cancellation.raise_if_requested()
 
         if target is None:
-            row_count = conn.execute(
-                "SELECT count(*) FROM read_csv_auto(?)" if output_format == "csv" else "SELECT count(*) FROM read_parquet(?)",
-                [staged_output.as_posix()],
-            ).fetchone()[0]
+            row_count = copied_row_count
+            if row_count is None:
+                row_count = conn.execute(
+                    "SELECT count(*) FROM read_csv_auto(?)" if output_format == "csv" else "SELECT count(*) FROM read_parquet(?)",
+                    [staged_output.as_posix()],
+                ).fetchone()[0]
+            if budget is not None and budget.row_limit is not None and row_count > budget.row_limit:
+                raise ResourceLimitExceeded(
+                    f"Extract output exceeded resourceBudget.rowLimit={budget.row_limit}."
+                )
             if cancellation is not None:
                 cancellation.raise_if_requested()
             staged_output.replace(output)
@@ -211,7 +252,13 @@ def execute_extract(
                 "rowCount": int(row_count),
             }
 
-        row_count = parquet_row_count(staged_output, connection=conn)
+        row_count = copied_row_count
+        if row_count is None:
+            row_count = parquet_row_count(staged_output, connection=conn)
+        if budget is not None and budget.row_limit is not None and row_count > budget.row_limit:
+            raise ResourceLimitExceeded(
+                f"Extract output exceeded resourceBudget.rowLimit={budget.row_limit}."
+            )
         columns = parquet_columns(staged_output, connection=conn)
         if compiled is not None:
             for index,column in enumerate(columns):

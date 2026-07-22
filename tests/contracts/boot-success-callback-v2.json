@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 2,
+  "eventId": "737d2db7-1fe9-5567-9fc1-99510fecdffd",
+  "sequence": 9,
+  "jobId": "11111111-1111-1111-1111-111111111111",
+  "queueJobId": "queue-7",
+  "eventType": "JOB_STATUS",
+  "status": "SUCCESS",
+  "stage": "extract",
+  "progress": 100.0,
+  "attempt": 2,
+  "processedRows": 7,
+  "processedBytes": 123,
+  "artifacts": [
+    {
+      "store": "LOCAL",
+      "key": "jobs/result.parquet",
+      "version": null,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sizeBytes": 123,
+      "rowCount": 7,
+      "contentType": "application/octet-stream",
+      "format": "PARQUET",
+      "schemaHash": null
+    }
+  ],
+  "error": null
+}

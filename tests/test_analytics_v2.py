@@ -416,6 +416,30 @@ class AnalyticsDslV2Test(unittest.TestCase):
 
 
 class AnalyticsArtifactTest(unittest.TestCase):
+    def test_legacy_runner_reuses_callback_free_render_operation(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+            request = AnalyticsArtifactRequest.model_validate(
+                artifact_payload("PNG", "artifact-shared-operation")
+            )
+            prepare_analysis_artifact_job(request, data_root)
+
+            with patch(
+                "cdw_extract.analytics_artifacts.render_analysis_artifact_operation",
+                wraps=artifact_module.render_analysis_artifact_operation,
+            ) as render_operation:
+                run_analysis_artifact_job(request, data_root)
+
+            render_operation.assert_called_once()
+            self.assertTrue(render_operation.call_args.kwargs["check_tombstone"])
+            path, manifest = analysis_artifact_download(
+                data_root,
+                USER_ID,
+                "artifact-shared-operation",
+            )
+            self.assertTrue(path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual("READY", manifest["status"])
+
     def test_display_options_are_normalized_and_number_formats_match_frontend_contract(self):
         expected_first_colors = {
             "PROFESSIONAL": "#2563EB",

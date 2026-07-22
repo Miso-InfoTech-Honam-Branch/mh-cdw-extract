@@ -11,10 +11,12 @@ import requests
 
 from .callback import callback_options as normalized_callback_options, post_json_callback
 from .clickhouse import write_clickhouse_table_parquet
-from .duck import connect, source_attach_sql, source_table_sql
+from .contracts import ResourceBudget
+from .duck import connect, quote_ident, source_attach_sql, source_table_sql
+from .errors import ResourceLimitExceeded
 from .jobs import save_job
 from .manifest import save_connection_manifest, utc_now
-from .paths import connection_root, table_file_name
+from .paths import connection_root, safe_path_segment, table_file_name
 
 TABLE_REFRESH = "TABLE_REFRESH"
 CALLBACK_MAX_ATTEMPTS = 3
@@ -144,7 +146,13 @@ def refresh_failure_callback_payload(job_id: str, connection_id: str, exc: Excep
     }
 
 
-def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path, job_id: str) -> dict:
+def refresh_tables_impl(
+    connection_id: str,
+    request: dict,
+    data_root: str | Path,
+    job_id: str,
+    budget: ResourceBudget | None = None,
+) -> dict:
     source = request.get("sourceConnection") or {}
     tables = request.get("tables") or []
     if not connection_id:
@@ -154,14 +162,41 @@ def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path
 
     compression = ((request.get("options") or {}).get("compression") or "snappy").lower()
     root = connection_root(data_root, connection_id)
-    tmp = root / "_tmp" / job_id / "tables"
+    safe_job_id = safe_path_segment(job_id, "jobId")
+    snapshot_id = f"{safe_job_id}-{uuid.uuid4().hex[:12]}"
+    # Resolve only existing directory generations. On Windows, resolving a
+    # path while another thread creates one of its missing ancestors can
+    # transiently produce an inconsistent result. Creating and validating
+    # each trusted ancestor also lets us reject a redirected _tmp symlink
+    # before writing a snapshot beneath it.
+    root.mkdir(parents=True, exist_ok=True)
+    temporary_root_path = root / "_tmp"
+    temporary_root_path.mkdir(parents=True, exist_ok=True)
+    temporary_root = temporary_root_path.resolve()
+    if not temporary_root.is_relative_to(root):
+        raise ValueError("metadata refresh temporary path must remain beneath its connection root")
+    # Include the random snapshot generation in the staging path. Queue
+    # redelivery should normally be collapsed by CdwEngine, but this also
+    # keeps legacy/direct callers and a concurrent retry of the same jobId
+    # from writing into (or deleting) one another's temporary directory.
+    staging_root = temporary_root / snapshot_id
+    staging_root.mkdir()
+    staging_root = staging_root.resolve()
+    if not staging_root.is_relative_to(temporary_root):
+        raise ValueError("metadata refresh staging path must remain beneath its temporary root")
+    tmp = staging_root / "tables"
+    tmp.mkdir()
+    tmp = tmp.resolve()
+    if not tmp.is_relative_to(staging_root):
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise ValueError("metadata refresh paths must remain beneath their staging root")
     final_tables = root / "tables"
-    tmp.mkdir(parents=True, exist_ok=True)
 
     vendor = (source.get("vendor") or "postgresql").lower()
     conn = None
     artifacts = []
     total_rows = 0
+    staged_bytes = 0
     try:
         if vendor != "clickhouse":
             conn = connect(data_root, "refresh", job_id)
@@ -171,15 +206,30 @@ def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path
             conn.execute(attach_sql)
         for table in tables:
             file_name = table_file_name(table)
-            output = tmp / file_name
+            output = (tmp / file_name).resolve()
+            if not output.is_relative_to(tmp):
+                raise ValueError("metadata refresh output must remain beneath its staging directory")
             if vendor == "clickhouse":
-                row_count = write_clickhouse_table_parquet(source, table, output)
+                maximum_bytes = None
+                if budget is not None and budget.output_bytes is not None:
+                    maximum_bytes = max(0, budget.output_bytes - staged_bytes)
+                if maximum_bytes is None:
+                    row_count = write_clickhouse_table_parquet(source, table, output)
+                else:
+                    row_count = write_clickhouse_table_parquet(
+                        source,
+                        table,
+                        output,
+                        maximum_bytes=maximum_bytes,
+                    )
             else:
                 if conn is None:
                     raise RuntimeError("duckdb connection is not initialized")
                 select_list = "*"
                 if table.get("columns"):
-                    select_list = ", ".join(f'"{c["name"]}"' for c in table["columns"])
+                    select_list = ", ".join(
+                        quote_ident(str(column["name"])) for column in table["columns"]
+                    )
                 source_sql = f"SELECT {select_list} FROM {source_table_sql(source, table)}"
                 conn.execute(
                     f"COPY ({source_sql}) TO ? (FORMAT PARQUET, COMPRESSION {compression.upper()})",
@@ -187,31 +237,61 @@ def refresh_tables_impl(connection_id: str, request: dict, data_root: str | Path
                 )
                 row_count = conn.execute("SELECT count(*) FROM read_parquet(?)", [output.as_posix()]).fetchone()[0]
             total_rows += row_count
+            staged_bytes += output.stat().st_size
             artifacts.append(
                 {
                     "tableId": table.get("tableId"),
                     "schemaName": table.get("schemaName") or source.get("schemaName"),
                     "tableName": table.get("tableName"),
-                    "path": f"tables/{file_name}",
+                    "path": (Path("tables") / snapshot_id / file_name).as_posix(),
                     "rowCount": row_count,
                     "columns": table.get("columns") or [],
                 }
             )
+            if budget is not None and budget.row_limit is not None and total_rows > budget.row_limit:
+                raise ResourceLimitExceeded(
+                    f"Metadata refresh exceeded resourceBudget.rowLimit={budget.row_limit}."
+                )
+            if budget is not None and budget.output_bytes is not None and staged_bytes > budget.output_bytes:
+                raise ResourceLimitExceeded(
+                    f"Metadata refresh exceeded resourceBudget.outputBytes={budget.output_bytes}."
+                )
+            if budget is not None and vendor != "clickhouse" and staged_bytes > budget.temp_bytes:
+                raise ResourceLimitExceeded(
+                    f"Metadata refresh staging exceeded resourceBudget.tempBytes={budget.temp_bytes}."
+                )
+    except Exception:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+        raise
     finally:
         if conn is not None:
             conn.close()
 
-    if final_tables.exists():
-        shutil.rmtree(final_tables)
-    final_tables.parent.mkdir(parents=True, exist_ok=True)
-    tmp.replace(final_tables)
-    extracts = root / "extracts"
-    if extracts.exists():
-        shutil.rmtree(extracts)
+    # Publish an immutable snapshot. Existing extracts keep reading the
+    # manifest version they already resolved while new extracts atomically see
+    # the new manifest below; no live tables directory is deleted in place.
+    final_tables.mkdir(parents=True, exist_ok=True)
+    final_tables = final_tables.resolve()
+    if not final_tables.is_relative_to(root):
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+        raise ValueError("metadata refresh tables path must remain beneath its connection root")
+    final_snapshot = (final_tables / snapshot_id).resolve()
+    if not final_snapshot.is_relative_to(final_tables):
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+        raise ValueError("metadata refresh snapshot must remain beneath its tables directory")
+    try:
+        if final_snapshot.exists():
+            raise FileExistsError("metadata refresh snapshot already exists for this jobId")
+        tmp.replace(final_snapshot)
+    except Exception:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+        raise
+    shutil.rmtree(tmp.parent, ignore_errors=True)
 
     manifest = {
         "connectionId": connection_id,
         "status": "COMPLETED",
+        "snapshotId": snapshot_id,
         "tables": artifacts,
         "updatedAt": utc_now(),
     }
