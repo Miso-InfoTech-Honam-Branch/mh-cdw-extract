@@ -593,9 +593,13 @@ def execute_extract(
 def callback_payload(job: dict) -> dict:
     """저장된 작업 상태를 Boot 호환 추출 콜백 본문으로 변환한다."""
 
-    file_paths = job.get("filePaths")
-    if not file_paths and job.get("filePath"):
-        file_paths = [job["filePath"]]
+    result_file = job.get("artifact") or {}
+    # 결과 대상이 있는 추출은 실행기 로컬 절대경로가 아니라 DATA_ROOT 기준 키를 전달한다.
+    # Boot는 이 상대 키만 영속화하므로 실행기 호스트가 바뀌어도 결과를 안전하게 식별할 수 있다.
+    result_path = result_file.get("path") or job.get("filePath")
+    file_paths = [result_path] if result_file.get("path") else job.get("filePaths")
+    if not file_paths and result_path:
+        file_paths = [result_path]
     return {
         "status": job.get("state"),
         "state": job.get("state"),
@@ -606,7 +610,7 @@ def callback_payload(job: dict) -> dict:
         "runId": job.get("runId"),
         "rowCount": job.get("rowCount"),
         "duplicateCount": job.get("duplicateCount", 0),
-        "filePath": job.get("filePath"),
+        "filePath": result_path,
         "filePaths": file_paths or [],
         "message": job.get("message"),
         "errorCode": job.get("errorCode"),
@@ -614,10 +618,10 @@ def callback_payload(job: dict) -> dict:
         "resultUserDatasetId": job.get("resultUserDatasetId"),
         "resultUserDatasetFileId": job.get("resultUserDatasetFileId"),
         "resultColumns": job.get("resultColumns") or [],
-        "resultManifestPath": job.get("manifestPath") or (job.get("artifact") or {}).get("manifestPath"),
-        "resultSha256": (job.get("artifact") or {}).get("sha256Checksum"),
-        "resultSizeBytes": (job.get("artifact") or {}).get("sizeBytes"),
-        "resultSchemaHash": (job.get("artifact") or {}).get("schemaHash"),
+        "resultManifestPath": result_file.get("manifestPath") or job.get("manifestPath"),
+        "resultSha256": result_file.get("sha256Checksum"),
+        "resultSizeBytes": result_file.get("sizeBytes"),
+        "resultSchemaHash": result_file.get("schemaHash"),
         "artifact": job.get("artifact"),
     }
 

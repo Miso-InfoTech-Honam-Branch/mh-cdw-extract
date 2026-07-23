@@ -4,7 +4,33 @@
   "jobType": "EXTRACT",
   "idempotencyKey": "python-fixture-extract-1",
   "command": {
-    "pipelineVersionId": "22222222-2222-2222-2222-222222222222"
+    "connectionId": "connection-1",
+    "request": {
+      "pipeline": {
+        "pipelineVersion": 1,
+        "steps": [
+          {
+            "stepId": "output",
+            "type": "OUTPUT",
+            "name": "Output",
+            "enabled": true,
+            "config": {}
+          }
+        ]
+      },
+      "sourceColumns": [
+        {
+          "columnId": "src:patient_id",
+          "physicalName": "patient_id",
+          "label": "Patient ID",
+          "dataType": "VARCHAR",
+          "nullable": false
+        }
+      ],
+      "expectedPipelineHash": "sha256:7d7de4ba92f0cd709a9831d3c1d8921ec64b75c24f53ca49ba8252cb67c845f3",
+      "expectedSourceSchemaHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expectedCompilerVersion": "1"
+    }
   },
   "resourceBudget": {
     "cpuThreads": 16,

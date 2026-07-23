@@ -278,6 +278,12 @@ class AsyncExtractTest(unittest.TestCase):
             self.assertEqual("extract-run-1", callback["runId"])
             self.assertEqual("result-dataset-1", callback["resultUserDatasetId"])
             self.assertEqual(["patient_id", "patient_name"], [column["name"] for column in callback["resultColumns"]])
+            self.assertEqual(manifest["path"], callback["filePath"])
+            self.assertEqual([manifest["path"]], callback["filePaths"])
+            self.assertEqual(manifest["manifestPath"], callback["resultManifestPath"])
+            self.assertEqual(manifest["sha256Checksum"], callback["resultSha256"])
+            self.assertEqual(manifest["sizeBytes"], callback["resultSizeBytes"])
+            self.assertEqual(manifest["schemaHash"], callback["resultSchemaHash"])
 
             reused = extract_module.extract(
                 "user-dataset",

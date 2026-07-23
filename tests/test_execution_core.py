@@ -158,6 +158,13 @@ class ExecutionCoreTest(unittest.TestCase):
         )
         parsed_envelope = JobEnvelope.model_validate(envelope_payload)
         self.assertEqual(envelope_payload, parsed_envelope.transport_dict())
+        extract_request = parsed_envelope.command["request"]
+        self.assertEqual(1, extract_request["pipeline"]["pipelineVersion"])
+        self.assertTrue(extract_request["pipeline"]["steps"])
+        self.assertTrue(extract_request["sourceColumns"])
+        self.assertTrue(extract_request["expectedPipelineHash"].startswith("sha256:"))
+        self.assertTrue(extract_request["expectedSourceSchemaHash"].startswith("sha256:"))
+        self.assertEqual("1", extract_request["expectedCompilerVersion"])
 
         for fixture_name in (
             "boot-success-callback-v2.json",
