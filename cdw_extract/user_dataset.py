@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
 import shutil
@@ -20,6 +19,11 @@ from .errors import ResourceLimitExceeded
 from openpyxl import load_workbook
 
 from .duck import connect, sql_literal
+from .parquet_metadata import (
+    file_sha256 as parquet_file_sha256,
+    parquet_file_metadata,
+    parquet_schema_columns,
+)
 
 USER_DATASET_DIR = "user-datasets"
 USER_DATASET_CONVERT = "USER_DATASET_CONVERT"
@@ -125,11 +129,7 @@ def save_dataset_file_manifest(
 def file_sha256(path: Path) -> str:
     """파일을 청크 단위로 읽어 SHA-256 체크섬을 계산한다."""
 
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return parquet_file_sha256(path)
 
 
 def _publish_immutable_dataset_generation(
@@ -586,22 +586,10 @@ def parquet_columns(
 
     conn = connection or connect(data_root, "parquet-schema", operation_id)
     try:
-        rows = conn.execute(
-            f"DESCRIBE SELECT * FROM read_parquet({sql_literal(output_path.as_posix())})"
-        ).fetchall()
+        return parquet_schema_columns(output_path, conn)
     finally:
         if connection is None:
             conn.close()
-    return [
-        {
-            "originalName": row[0],
-            "name": row[0],
-            "type": row[1],
-            "ordinal": index,
-            "nullable": True,
-        }
-        for index, row in enumerate(rows, start=1)
-    ]
 
 
 def parquet_row_count(
@@ -694,12 +682,23 @@ def convert_user_dataset_file_from_path(
             input_suffix = suffix
 
         write_parquet_from_upload(input_path, input_suffix, staged_parquet_path, data_root, job_id)
-        row_count = parquet_row_count(staged_parquet_path, data_root, job_id)
+        inspection_connection = connect(data_root, "user-dataset-inspect", job_id)
+        try:
+            row_count = parquet_row_count(
+                staged_parquet_path,
+                connection=inspection_connection,
+            )
+            staged_metadata = parquet_file_metadata(
+                staged_parquet_path,
+                inspection_connection,
+            )
+        finally:
+            inspection_connection.close()
         if budget is not None and budget.row_limit is not None and row_count > budget.row_limit:
             raise ResourceLimitExceeded(
                 f"User dataset output exceeded resourceBudget.rowLimit={budget.row_limit}."
             )
-        output_size = staged_parquet_path.stat().st_size
+        output_size = staged_metadata["sizeBytes"]
         if budget is not None and budget.output_bytes is not None and output_size > budget.output_bytes:
             raise ResourceLimitExceeded(
                 f"User dataset output exceeded resourceBudget.outputBytes={budget.output_bytes}."
@@ -712,7 +711,7 @@ def convert_user_dataset_file_from_path(
                 raise ResourceLimitExceeded(
                     f"User dataset staging exceeded resourceBudget.tempBytes={budget.temp_bytes}."
                 )
-        columns = parquet_columns(staged_parquet_path, data_root, job_id)
+        columns = staged_metadata["columns"]
         manifest = {
             "requestId": request_id,
             "jobId": job_id,
@@ -724,6 +723,9 @@ def convert_user_dataset_file_from_path(
             "path": dataset_file_relative_path(user_id, user_dataset_id, user_dataset_file_id),
             "rowCount": row_count,
             "columns": columns,
+            "sizeBytes": staged_metadata["sizeBytes"],
+            "sha256Checksum": staged_metadata["sha256Checksum"],
+            "schemaHash": staged_metadata["schemaHash"],
             "fileType": suffix.lstrip(".").upper(),
             "headerYn": header,
             "delimiter": delimiter if suffix == ".csv" else None,
@@ -742,6 +744,24 @@ def convert_user_dataset_file_from_path(
             user_dataset_file_id,
             manifest,
         )
+        published_path = dataset_file_parquet_path(
+            data_root,
+            user_id,
+            user_dataset_id,
+            user_dataset_file_id,
+        )
+        published_connection = connect(
+            data_root,
+            "user-dataset-published-metadata",
+            job_id,
+        )
+        try:
+            published_metadata = parquet_file_metadata(
+                published_path,
+                published_connection,
+            )
+        finally:
+            published_connection.close()
         return {
             "requestId": request_id,
             "jobId": job_id,
@@ -751,7 +771,15 @@ def convert_user_dataset_file_from_path(
             "userDatasetFileId": user_dataset_file_id,
             "status": "SUCCESS",
             "rowCount": row_count,
-            "columns": columns,
+            "columns": published_metadata["columns"],
+            "resultPath": dataset_file_relative_path(
+                user_id,
+                user_dataset_id,
+                user_dataset_file_id,
+            ),
+            "resultSizeBytes": published_metadata["sizeBytes"],
+            "resultSha256": published_metadata["sha256Checksum"],
+            "schemaHash": published_metadata["schemaHash"],
             "errorCode": None,
             "message": None,
         }

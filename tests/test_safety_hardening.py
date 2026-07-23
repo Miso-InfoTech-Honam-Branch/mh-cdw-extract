@@ -124,7 +124,15 @@ class PathSafetyTest(unittest.TestCase):
         def write_table(_source, _table, output):
             path = Path(output)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"PAR1")
+            connection = duckdb.connect()
+            try:
+                connection.execute(
+                    "COPY (SELECT range AS patient_id FROM range(3)) "
+                    "TO ? (FORMAT PARQUET)",
+                    [path.as_posix()],
+                )
+            finally:
+                connection.close()
             return 3
 
         with tempfile.TemporaryDirectory() as temporary, patch(
@@ -141,7 +149,9 @@ class PathSafetyTest(unittest.TestCase):
             artifact = result["tables"][0]
             self.assertEqual(table["schemaName"], artifact["schemaName"])
             self.assertEqual(table["tableName"], artifact["tableName"])
-            published = (connection_root(temporary, "connection-1") / artifact["path"]).resolve()
+            self.assertTrue(artifact["path"].startswith("connections/connection-1/"))
+            self.assertFalse(Path(artifact["path"]).is_absolute())
+            published = (Path(temporary) / artifact["path"]).resolve()
             self.assertTrue(published.is_file())
             self.assertTrue(
                 published.is_relative_to(

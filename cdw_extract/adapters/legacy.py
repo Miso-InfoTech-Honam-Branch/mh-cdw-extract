@@ -38,6 +38,7 @@ def _descriptor(
     *,
     row_count: int | None = None,
     format_name: str | None = None,
+    schema_hash: str | None = None,
 ) -> ArtifactDescriptor:
     resolved = Path(path).expanduser().resolve()
     try:
@@ -54,6 +55,7 @@ def _descriptor(
         rowCount=row_count,
         contentType=content_type,
         format=(format_name or resolved.suffix.lstrip(".")).upper() or "OTHER",
+        schemaHash=schema_hash,
     )
 
 
@@ -97,6 +99,7 @@ def _extract_handler(
             output_path,
             row_count=result.get("rowCount"),
             format_name=result.get("outputFormat"),
+            schema_hash=(result.get("artifact") or {}).get("schemaHash"),
         ),
     )
     return {"artifacts": artifacts, "metrics": _public_metrics(result)}
@@ -164,9 +167,10 @@ def _metadata_refresh_handler(
             artifacts.append(
                 _descriptor(
                     _root(services),
-                    _root(services) / "connections" / connection_id / relative,
+                    _root(services) / relative,
                     row_count=item.get("rowCount"),
                     format_name="PARQUET",
+                    schema_hash=item.get("schemaHash"),
                 )
             )
     metrics = _public_metrics(result)
@@ -236,6 +240,7 @@ def _dataset_convert_handler(
                 output,
                 row_count=result.get("rowCount"),
                 format_name="PARQUET",
+                schema_hash=result.get("schemaHash"),
             ),
         ),
         "metrics": _public_metrics(result),

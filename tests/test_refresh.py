@@ -50,9 +50,12 @@ def refresh_result(job_id: str) -> dict:
                 "tableId": "table-1",
                 "schemaName": "testdb",
                 "tableName": "patients",
-                "path": "tables/testdb.patients.parquet",
+                "path": "connections/connection-1/tables/testdb.patients.parquet",
                 "rowCount": 12,
                 "columns": [{"columnId": "column-1", "name": "patient_id"}],
+                "sizeBytes": 1024,
+                "sha256Checksum": "a" * 64,
+                "schemaHash": "b" * 64,
             }
         ],
     }

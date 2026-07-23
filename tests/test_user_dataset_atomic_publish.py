@@ -10,6 +10,7 @@ from cdw_extract.user_dataset import (
     convert_user_dataset_file_from_path,
     dataset_file_manifest_path,
     dataset_file_parquet_path,
+    dataset_file_relative_path,
     dataset_file_root,
     file_sha256,
     load_dataset_file_manifest,
@@ -58,8 +59,22 @@ class UserDatasetAtomicPublishTest(unittest.TestCase):
             manifest = load_dataset_file_manifest(
                 data_root, "user-1", "dataset-1", "file-1"
             )
+            published_path = dataset_file_parquet_path(
+                data_root, "user-1", "dataset-1", "file-1"
+            )
             self.assertEqual("SUCCESS", first["status"])
             self.assertEqual(first, second)
+            self.assertEqual(
+                dataset_file_relative_path("user-1", "dataset-1", "file-1"),
+                first["resultPath"],
+            )
+            self.assertFalse(Path(first["resultPath"]).is_absolute())
+            self.assertEqual(published_path.stat().st_size, first["resultSizeBytes"])
+            self.assertEqual(file_sha256(published_path), first["resultSha256"])
+            self.assertRegex(first["schemaHash"], r"^[0-9a-f]{64}$")
+            self.assertEqual(first["resultSizeBytes"], manifest["sizeBytes"])
+            self.assertEqual(first["resultSha256"], manifest["sha256Checksum"])
+            self.assertEqual(first["schemaHash"], manifest["schemaHash"])
             self.assertEqual("2026-01-01T00:00:00+00:00", manifest["createdAt"])
             self.assertEqual(
                 first_checksum,

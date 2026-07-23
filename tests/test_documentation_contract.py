@@ -27,6 +27,7 @@ EXPECTED_MODULES = {
     "extract.py",
     "jobs.py",
     "manifest.py",
+    "parquet_metadata.py",
     "paths.py",
     "preview.py",
     "query.py",

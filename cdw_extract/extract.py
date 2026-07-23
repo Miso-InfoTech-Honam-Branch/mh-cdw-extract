@@ -24,6 +24,7 @@ from .jobs import (
     update_job,
 )
 from .query import final_query
+from .parquet_metadata import parquet_schema_hash
 from .transforms.compiler import CompiledPipeline
 from .transforms.runtime import compile_pipeline_request
 from .user_dataset import (
@@ -471,6 +472,7 @@ def _publish_dataset_output(
             "idempotencyKey": target.idempotency_key,
             "rowCount": row_count,
             "columns": columns,
+            "schemaHash": parquet_schema_hash(columns),
             "createdAt": utc_now(),
         },
     )
@@ -505,6 +507,7 @@ def _publish_dataset_output(
             "rowCount": published_row_count,
             "sizeBytes": manifest.get("sizeBytes"),
             "sha256Checksum": manifest.get("sha256Checksum"),
+            "schemaHash": manifest.get("schemaHash"),
             "columns": published_columns,
         },
         "_resultTarget": True,
@@ -613,6 +616,8 @@ def callback_payload(job: dict) -> dict:
         "resultColumns": job.get("resultColumns") or [],
         "resultManifestPath": job.get("manifestPath") or (job.get("artifact") or {}).get("manifestPath"),
         "resultSha256": (job.get("artifact") or {}).get("sha256Checksum"),
+        "resultSizeBytes": (job.get("artifact") or {}).get("sizeBytes"),
+        "resultSchemaHash": (job.get("artifact") or {}).get("schemaHash"),
         "artifact": job.get("artifact"),
     }
 

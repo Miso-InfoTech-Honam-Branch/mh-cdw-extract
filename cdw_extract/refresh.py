@@ -20,6 +20,7 @@ from .duck import connect, quote_ident, source_attach_sql, source_table_sql
 from .errors import ResourceLimitExceeded
 from .jobs import save_job
 from .manifest import save_connection_manifest, utc_now
+from .parquet_metadata import parquet_file_metadata
 from .paths import connection_root, safe_path_segment, table_file_name
 
 TABLE_REFRESH = "TABLE_REFRESH"
@@ -233,6 +234,23 @@ class _RefreshSnapshotPlan:
     def published_path(self, file_name: str) -> str:
         return (Path("tables") / self.snapshot_id / file_name).as_posix()
 
+    def result_path(self, file_name: str) -> str:
+        """DATA_ROOT 기준으로 Boot에 전달할 전체 상대 저장소 키를 만든다."""
+
+        return (
+            Path("connections")
+            / self.root.name
+            / self.published_path(file_name)
+        ).as_posix()
+
+    def manifest_path(self, result_path: str) -> str:
+        """전체 상대 저장소 키를 connection manifest 기준 경로로 변환한다."""
+
+        prefix = (Path("connections") / self.root.name).as_posix() + "/"
+        if not result_path.startswith(prefix):
+            raise ValueError("metadata refresh result path is outside its connection")
+        return result_path[len(prefix) :]
+
     def publish(self) -> None:
         final_tables = self._validated_final_tables()
         final_snapshot = (final_tables / self.snapshot_id).resolve()
@@ -319,11 +337,19 @@ class _RefreshExportRun:
 
     def execute(self) -> list[dict]:
         connection = self._source_connection()
+        metadata_connection = connection or connect(
+            self.data_root,
+            "refresh-parquet-metadata",
+            self.job_id,
+            budget=self.budget,
+        )
         try:
             self._attach_source(connection)
             for table in self.tables:
-                self._export_table(connection, table)
+                self._export_table(connection, metadata_connection, table)
         finally:
+            if metadata_connection is not connection:
+                metadata_connection.close()
             if connection is not None:
                 connection.close()
         return self.artifacts
@@ -341,11 +367,19 @@ class _RefreshExportRun:
         connection.execute(f"LOAD {extension}")
         connection.execute(attach_sql)
 
-    def _export_table(self, connection: Any | None, table: dict) -> None:
+    def _export_table(
+        self,
+        connection: Any | None,
+        metadata_connection: Any,
+        table: dict,
+    ) -> None:
         file_name, output = self.plan.output_path(table)
         row_count = self._write_table(connection, table, output)
-        self.artifacts.append(self._artifact(table, file_name, row_count))
-        self.usage.record(row_count, output.stat().st_size)
+        metadata = parquet_file_metadata(output, metadata_connection)
+        self.usage.record(row_count, metadata["sizeBytes"])
+        self.artifacts.append(
+            self._artifact(table, file_name, row_count, metadata)
+        )
 
     def _write_table(self, connection: Any | None, table: dict, output: Path) -> int:
         if self.vendor == "clickhouse":
@@ -382,14 +416,23 @@ class _RefreshExportRun:
             [output.as_posix()],
         ).fetchone()[0]
 
-    def _artifact(self, table: dict, file_name: str, row_count: int) -> dict:
+    def _artifact(
+        self,
+        table: dict,
+        file_name: str,
+        row_count: int,
+        metadata: dict,
+    ) -> dict:
         return {
             "tableId": table.get("tableId"),
             "schemaName": table.get("schemaName") or self.source.get("schemaName"),
             "tableName": table.get("tableName"),
-            "path": self.plan.published_path(file_name),
+            "path": self.plan.result_path(file_name),
             "rowCount": row_count,
             "columns": table.get("columns") or [],
+            "sizeBytes": metadata["sizeBytes"],
+            "sha256Checksum": metadata["sha256Checksum"],
+            "schemaHash": metadata["schemaHash"],
         }
 
 
@@ -424,7 +467,13 @@ def _save_refresh_manifest(
             "connectionId": connection_id,
             "status": "COMPLETED",
             "snapshotId": plan.snapshot_id,
-            "tables": artifacts,
+            "tables": [
+                {
+                    **artifact,
+                    "path": plan.manifest_path(artifact["path"]),
+                }
+                for artifact in artifacts
+            ],
             "updatedAt": utc_now(),
         },
     )

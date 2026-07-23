@@ -9,7 +9,7 @@
 - 같은 sequence의 재전송에는 같은 deterministic `eventId`를 사용한다.
 - 작업 종료 callback 확인 뒤 `services.cancellations.forget(job_id)`를 호출한다.
 
-Metadata refresh는 `connections/{connectionId}/tables/{snapshotId}` 아래에 불변 스냅샷을 게시한 뒤 manifest를 원자적으로 전환한다. 실행 중인 추출이 참조하는 이전 스냅샷은 삭제하지 말고, queue host의 보존 작업이 Boot의 활성 job/data-asset 참조를 확인한 뒤 정리해야 한다.
+Metadata refresh는 `connections/{connectionId}/tables/{snapshotId}` 아래에 불변 스냅샷을 게시한 뒤 manifest를 원자적으로 전환한다. 실행 중인 추출이 참조하는 이전 스냅샷은 삭제하지 말고, queue host의 보존 작업이 Boot의 활성 작업과 기능별 파일 참조(메타데이터 통계, 사용자 데이터셋 파일, 분석 산출물)를 확인한 뒤 정리해야 한다.
 
 `JobCallbackEvent.metrics`는 기존 업무 상태 투영에 사용된다. JSON object만 허용하며 UTF-8 직렬화 크기가 2 MiB를 넘으면 안 된다. 주요 값은 `rowCount`, `resultColumns`, metadata refresh의 `tables`, 분석 artifact 식별자다. 절대 파일 경로와 비밀값은 metrics에 넣지 않는다.
 

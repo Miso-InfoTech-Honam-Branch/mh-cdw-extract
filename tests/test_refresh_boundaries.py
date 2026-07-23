@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
+
 from cdw_extract.manifest import load_connection_manifest, save_connection_manifest
 from cdw_extract.refresh import refresh_tables_impl
 
@@ -34,9 +36,17 @@ class RefreshBoundaryTest(unittest.TestCase):
         snapshot_id = f"refresh-job-{generation.hex[:12]}"
 
         def write_table(_source, table, output, **_kwargs):
-            Path(output).write_bytes(b"partial-parquet")
             if table["tableId"] == "second":
+                Path(output).write_bytes(b"partial-parquet")
                 raise RuntimeError("upstream export failed")
+            connection = duckdb.connect()
+            try:
+                connection.execute(
+                    "COPY (SELECT 1 AS value) TO ? (FORMAT PARQUET)",
+                    [Path(output).as_posix()],
+                )
+            finally:
+                connection.close()
             return 1
 
         with tempfile.TemporaryDirectory() as data_root:

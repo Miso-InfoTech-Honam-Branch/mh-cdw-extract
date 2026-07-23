@@ -27,12 +27,25 @@ from cdw_extract.clickhouse import write_clickhouse_table_parquet
 from cdw_extract.errors import JobCancelled, ResourceLimitExceeded
 from cdw_extract.execution_scope import ExecutionResources, execution_resource_scope
 from cdw_extract.manifest import load_connection_manifest
+from cdw_extract.parquet_metadata import file_sha256
 from cdw_extract.refresh import refresh_tables_impl
 from cdw_extract.user_dataset import write_normalized_csv
 
 
 duck_module = importlib.import_module("cdw_extract.duck")
 extract_module = importlib.import_module("cdw_extract.extract")
+
+
+def _opaque_file_metadata(path: str | Path, _connection) -> dict:
+    """Parquet 구조와 무관한 경계 테스트에서 파일 자체의 크기와 해시만 제공한다."""
+
+    output = Path(path)
+    return {
+        "sizeBytes": output.stat().st_size,
+        "sha256Checksum": file_sha256(output),
+        "schemaHash": "0" * 64,
+        "columns": [],
+    }
 
 
 class _RecordingConnection:
@@ -348,8 +361,15 @@ class ResourceSafetyV2Test(unittest.TestCase):
         def write_table(_source, _table, output):
             nonlocal generation
             generation += 1
-            Path(output).parent.mkdir(parents=True, exist_ok=True)
-            Path(output).write_bytes(f"PAR1-generation-{generation}".encode())
+            connection = duckdb.connect()
+            try:
+                connection.execute(
+                    "COPY (SELECT range AS patient_id "
+                    f"FROM range({generation})) TO ? (FORMAT PARQUET)",
+                    [Path(output).as_posix()],
+                )
+            finally:
+                connection.close()
             return generation
 
         with tempfile.TemporaryDirectory() as root, patch(
@@ -357,16 +377,33 @@ class ResourceSafetyV2Test(unittest.TestCase):
             side_effect=write_table,
         ):
             first = refresh_tables_impl("connection-1", request, root, str(uuid.uuid4()))
-            first_path = Path(root) / "connections" / "connection-1" / first["tables"][0]["path"]
+            first_artifact = first["tables"][0]
+            first_path = Path(root) / first_artifact["path"]
             first_bytes = first_path.read_bytes()
             second = refresh_tables_impl("connection-1", request, root, str(uuid.uuid4()))
-            second_path = Path(root) / "connections" / "connection-1" / second["tables"][0]["path"]
+            second_artifact = second["tables"][0]
+            second_path = Path(root) / second_artifact["path"]
             manifest = load_connection_manifest("connection-1", root)
 
             self.assertNotEqual(first_path, second_path)
             self.assertEqual(first_bytes, first_path.read_bytes())
             self.assertTrue(second_path.is_file())
-            self.assertEqual(second["tables"][0]["path"], manifest["tables"][0]["path"])
+            self.assertTrue(
+                second_artifact["path"].startswith("connections/connection-1/tables/")
+            )
+            self.assertFalse(Path(second_artifact["path"]).is_absolute())
+            self.assertEqual(second_path.stat().st_size, second_artifact["sizeBytes"])
+            self.assertEqual(file_sha256(second_path), second_artifact["sha256Checksum"])
+            self.assertRegex(second_artifact["schemaHash"], r"^[0-9a-f]{64}$")
+            self.assertTrue(manifest["tables"][0]["path"].startswith("tables/"))
+            self.assertEqual(
+                second_artifact["path"],
+                f"connections/connection-1/{manifest['tables'][0]['path']}",
+            )
+            self.assertEqual(
+                second_artifact["schemaHash"],
+                manifest["tables"][0]["schemaHash"],
+            )
 
     def test_clickhouse_refresh_passes_remaining_byte_budget_per_table(self) -> None:
         request = {
@@ -386,6 +423,9 @@ class ResourceSafetyV2Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch(
             "cdw_extract.refresh.write_clickhouse_table_parquet",
             side_effect=write_table,
+        ), patch(
+            "cdw_extract.refresh.parquet_file_metadata",
+            side_effect=_opaque_file_metadata,
         ):
             refresh_tables_impl(
                 "connection-1",
@@ -413,6 +453,9 @@ class ResourceSafetyV2Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch(
             "cdw_extract.refresh.write_clickhouse_table_parquet",
             side_effect=write_table,
+        ), patch(
+            "cdw_extract.refresh.parquet_file_metadata",
+            side_effect=_opaque_file_metadata,
         ):
             refresh_tables_impl(
                 "connection-1",
@@ -451,7 +494,19 @@ class ResourceSafetyV2Test(unittest.TestCase):
             with lock:
                 staged_paths.append(path)
             barrier.wait(timeout=5)
-            path.write_bytes(threading.current_thread().name.encode())
+            connection = duckdb.connect()
+            try:
+                connection.execute("CREATE TABLE output(worker VARCHAR)")
+                connection.execute(
+                    "INSERT INTO output VALUES (?)",
+                    [threading.current_thread().name],
+                )
+                connection.execute(
+                    "COPY output TO ? (FORMAT PARQUET)",
+                    [path.as_posix()],
+                )
+            finally:
+                connection.close()
             return 1
 
         results: list[dict] = []
@@ -480,7 +535,7 @@ class ResourceSafetyV2Test(unittest.TestCase):
             self.assertEqual(2, len(results))
             self.assertEqual(2, len(set(staged_paths)))
             published_paths = {
-                Path(root) / "connections" / "connection-1" / result["tables"][0]["path"]
+                Path(root) / result["tables"][0]["path"]
                 for result in results
             }
             self.assertEqual(2, len(published_paths))
@@ -523,6 +578,9 @@ class ResourceSafetyV2Test(unittest.TestCase):
         ), patch(
             "cdw_extract.refresh.source_table_sql",
             return_value='"source"."patients"',
+        ), patch(
+            "cdw_extract.refresh.parquet_file_metadata",
+            side_effect=_opaque_file_metadata,
         ):
             refresh_tables_impl("connection-1", request, root, str(uuid.uuid4()))
 
