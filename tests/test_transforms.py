@@ -339,6 +339,76 @@ class TransformCompilerTest(unittest.TestCase):
             ).fetchone(),
         )
 
+    def test_filter_can_use_a_derived_column_before_later_transformations(self):
+        source_schema = [
+            ColumnSchema(
+                "src:service_date",
+                "service_date",
+                "Service date",
+                "STRING",
+                False,
+                ("src:service_date",),
+            )
+        ]
+        compiled = compile_pipeline(
+            """
+            SELECT *
+            FROM (VALUES ('20170413'), ('20160413')) source(service_date)
+            """,
+            source_schema,
+            {"steps": [
+                {"stepId": "cast-date", "type": "CAST", "config": {
+                    "columnId": "src:service_date",
+                    "targetType": "DATE",
+                    "inputFormat": "YYYYMMDD",
+                    "outputId": "cast",
+                }},
+                {"stepId": "filter-2017", "type": "FILTER", "config": {
+                    "conditions": [{
+                        "columnId": "out:cast-date:cast",
+                        "operator": "BETWEEN",
+                        "values": ["2017-01-01", "2017-12-31"],
+                    }],
+                }},
+                {"stepId": "extract-year", "type": "SPLIT_COLUMN", "config": {
+                    "inputColumnId": "out:cast-date:cast",
+                    "mode": "SLICE",
+                    "startAt": 1,
+                    "length": 4,
+                    "outputs": [{"outputId": "year", "label": "Year"}],
+                }},
+                {"stepId": "short-year", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "out:extract-year:year",
+                    "mappings": [{"from": "2017", "to": "17"}],
+                    "outputId": "year",
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(
+            ["out:cast-date:cast", "out:short-year:year"],
+            [column.column_id for column in compiled.output_schema],
+        )
+        self.assertEqual(
+            [(date(2017, 4, 13), "17")],
+            duckdb.connect().execute(
+                compiled.sql, compiled.parameters
+            ).fetchall(),
+        )
+        filter_result = next(
+            item
+            for item in compiled.step_schemas
+            if item["stepId"] == "filter-2017"
+        )
+        self.assertEqual(
+            ["out:cast-date:cast"],
+            [
+                column["columnId"]
+                for column in filter_result["outputSchema"]
+            ],
+        )
+
     def test_replace_value_uses_declared_order_against_the_original_value(self):
         compiled = compile_pipeline(
             "SELECT * FROM (VALUES ('전남'), ('조대'), ('전남조대')) t(department)",
