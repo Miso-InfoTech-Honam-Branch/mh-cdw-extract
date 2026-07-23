@@ -168,6 +168,27 @@ class PipelineCompiler:
     def passthrough(self) -> list[str]:
         return [quote_ident(item.physical_name) for item in self.schema]
 
+    def _replace_column(
+        self,
+        step_id: str,
+        source: ColumnSchema,
+        expression: str,
+        output: ColumnSchema,
+        warning_start: int,
+    ) -> None:
+        """원본 열의 위치를 유지한 채 변환 결과 열로 치환한다."""
+
+        select: list[str] = []
+        schema: list[ColumnSchema] = []
+        for item in self.schema:
+            if item.column_id == source.column_id:
+                select.append(f"{expression} AS {quote_ident(output.physical_name)}")
+                schema.append(output)
+            else:
+                select.append(quote_ident(item.physical_name))
+                schema.append(item)
+        self.output(step_id, select, schema, warning_start)
+
     def compile(self) -> CompiledPipeline:
         steps = self.pipeline.get("steps") or []
         if len(steps) > MAX_STEPS:
@@ -377,24 +398,6 @@ class PipelineCompiler:
             "CAST",
             nullable=source.nullable or policy != "FAIL",
         )
-        keep_input = bool(config.get("keepInput", False))
-        if keep_input:
-            select = self.passthrough()
-            schema = list(self.schema)
-            select.append(f"{cast} AS {quote_ident(output.physical_name)}")
-            schema.append(output)
-        else:
-            # 원본 열을 제거하는 CAST는 열 위치까지 보존해야 후속 단계와 미리보기의
-            # 항목 순서가 사용자가 선택한 원본 순서에서 달라지지 않는다.
-            select = []
-            schema = []
-            for item in self.schema:
-                if item.column_id == source.column_id:
-                    select.append(f"{cast} AS {quote_ident(output.physical_name)}")
-                    schema.append(output)
-                else:
-                    select.append(quote_ident(item.physical_name))
-                    schema.append(item)
         warning_start = len(self.warnings)
         if policy == "DROP_ROW":
             relation_name = f"__cast_source_{len(self.step_schemas):03d}"
@@ -403,7 +406,9 @@ class PipelineCompiler:
             )
             self.relation = quote_ident(relation_name)
             self.warnings.append({"code": "CAST_DROPS_INVALID_ROWS", "stepId": step_id})
-        self.output(step_id, select, schema, warning_start)
+        # keepInput은 이전 요청과의 입력 호환을 위해 허용하지만 CAST 실행 의미는
+        # 언제나 원본 열을 같은 위치에서 바꾸는 것으로 고정한다.
+        self._replace_column(step_id, source, cast, output, warning_start)
 
     def step_fill_null(self, step_id: str, config: dict) -> None:
         source = self.column(config.get("columnId"))
@@ -417,13 +422,11 @@ class PipelineCompiler:
             "FILL_NULL",
             nullable=False,
         )
-        self.output(
+        self._replace_column(
             step_id,
-            self.passthrough()
-            + [
-                f"COALESCE({quote_ident(source.physical_name)}, ?) AS {quote_ident(output.physical_name)}"
-            ],
-            self.schema + [output],
+            source,
+            f"COALESCE({quote_ident(source.physical_name)}, ?)",
+            output,
             len(self.warnings),
         )
 
@@ -442,13 +445,11 @@ class PipelineCompiler:
             "TRIM",
             nullable=source.nullable,
         )
-        self.output(
+        self._replace_column(
             step_id,
-            self.passthrough()
-            + [
-                f"{fn}({quote_ident(source.physical_name)}) AS {quote_ident(output.physical_name)}"
-            ],
-            self.schema + [output],
+            source,
+            f"{fn}({quote_ident(source.physical_name)})",
+            output,
             len(self.warnings),
         )
 
@@ -466,13 +467,11 @@ class PipelineCompiler:
             "CHANGE_CASE",
             nullable=source.nullable,
         )
-        self.output(
+        self._replace_column(
             step_id,
-            self.passthrough()
-            + [
-                f"{mode}({quote_ident(source.physical_name)}) AS {quote_ident(output.physical_name)}"
-            ],
-            self.schema + [output],
+            source,
+            f"{mode}({quote_ident(source.physical_name)})",
+            output,
             len(self.warnings),
         )
 
@@ -635,11 +634,18 @@ class PipelineCompiler:
         if match_mode not in {"EXACT", "CONTAINS"}:
             raise ValueError("unsupported REPLACE_VALUE matchMode")
         parts = []
-        for item in mappings:
+        # 모든 규칙은 같은 원본값을 선언 순서대로 검사하고 첫 일치만 사용한다.
+        # 한 단계 안에서 치환 결과를 다음 규칙에 다시 넣지 않아 우발적인 연쇄·순환을 막는다.
+        for index, item in enumerate(mappings):
             source_value = item.get("from")
             if match_mode == "CONTAINS":
+                if not isinstance(source_value, str) or not source_value.strip():
+                    raise ValueError(
+                        "REPLACE_VALUE_CONTAINS_VALUE_REQUIRED: "
+                        f"mappings[{index}].from"
+                    )
                 escaped = (
-                    str(source_value or "")
+                    source_value
                     .replace("\\", "\\\\")
                     .replace("%", "\\%")
                     .replace("_", "\\_")
@@ -661,13 +667,11 @@ class PipelineCompiler:
             [source],
             "REPLACE_VALUE",
         )
-        self.output(
+        self._replace_column(
             step_id,
-            self.passthrough()
-            + [
-                f"CASE {' '.join(parts)} ELSE {otherwise} END AS {quote_ident(output.physical_name)}"
-            ],
-            self.schema + [output],
+            source,
+            f"CASE {' '.join(parts)} ELSE {otherwise} END",
+            output,
             len(self.warnings),
         )
 
@@ -754,18 +758,16 @@ class PipelineCompiler:
         output = derived_column(
             step_id,
             config.get("outputId") or "code-name",
-            config.get("label") or f"{source.label} 이름",
+            config.get("label") or source.label,
             "STRING",
             [source],
             "CODE_LOOKUP",
         )
-        self.output(
+        self._replace_column(
             step_id,
-            self.passthrough()
-            + [
-                f"CASE {' '.join(parts)} ELSE NULL END AS {quote_ident(output.physical_name)}"
-            ],
-            self.schema + [output],
+            source,
+            f"CASE {' '.join(parts)} ELSE NULL END",
+            output,
             len(self.warnings),
         )
 
@@ -797,8 +799,8 @@ class PipelineCompiler:
         expr = f"row_number() OVER ({over})" + (f" + {start - 1}" if start > 1 else "")
         self.output(
             step_id,
-            self.passthrough() + [f"{expr} AS {quote_ident(output.physical_name)}"],
-            self.schema + [output],
+            [f"{expr} AS {quote_ident(output.physical_name)}"] + self.passthrough(),
+            [output] + self.schema,
             len(self.warnings),
         )
 

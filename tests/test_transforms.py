@@ -179,8 +179,303 @@ class TransformCompilerTest(unittest.TestCase):
             ]},
         )
         row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
-        self.assertEqual("A01DAST", row[0])
-        self.assertEqual("분류 A", row[-1])
+        self.assertEqual("분류 A", row[0])
+        self.assertEqual(3, len(row))
+        self.assertEqual("out:replace:replaced", compiled.output_schema[0].column_id)
+
+    def test_in_place_transforms_replace_a_middle_column(self):
+        source_schema = [
+            ColumnSchema("src:left", "left_value", "왼쪽", "STRING", False, ("src:left",)),
+            ColumnSchema("src:middle", "middle_value", "가운데", "STRING", True, ("src:middle",)),
+            ColumnSchema("src:right", "right_value", "오른쪽", "STRING", False, ("src:right",)),
+        ]
+        cases = [
+            (
+                "FILL_NULL",
+                "SELECT 'L' AS left_value, NULL::VARCHAR AS middle_value, 'R' AS right_value",
+                {"columnId": "src:middle", "value": "채움", "outputId": "value"},
+                "채움",
+            ),
+            (
+                "TRIM",
+                "SELECT 'L' AS left_value, '  값  ' AS middle_value, 'R' AS right_value",
+                {"columnId": "src:middle", "mode": "BOTH", "outputId": "value"},
+                "값",
+            ),
+            (
+                "CHANGE_CASE",
+                "SELECT 'L' AS left_value, 'abc' AS middle_value, 'R' AS right_value",
+                {"columnId": "src:middle", "mode": "UPPER", "outputId": "value"},
+                "ABC",
+            ),
+            (
+                "REPLACE_VALUE",
+                "SELECT 'L' AS left_value, '전남' AS middle_value, 'R' AS right_value",
+                {
+                    "columnId": "src:middle",
+                    "mappings": [{"from": "전남", "to": "그럴"}],
+                    "outputId": "value",
+                },
+                "그럴",
+            ),
+            (
+                "CODE_LOOKUP",
+                "SELECT 'L' AS left_value, '01' AS middle_value, 'R' AS right_value",
+                {
+                    "columnId": "src:middle",
+                    "values": [{"code": "01", "name": "전남"}],
+                    "outputId": "value",
+                },
+                "전남",
+            ),
+        ]
+
+        for step_type, source_sql, config, expected in cases:
+            with self.subTest(step_type=step_type):
+                compiled = compile_pipeline(
+                    source_sql,
+                    source_schema,
+                    {"steps": [
+                        {"stepId": "work", "type": step_type, "config": config},
+                        {"stepId": "output", "type": "OUTPUT", "config": {}},
+                    ]},
+                )
+                self.assertEqual(
+                    ["src:left", "out:work:value", "src:right"],
+                    [column.column_id for column in compiled.output_schema],
+                )
+                self.assertEqual("가운데", compiled.output_schema[1].label)
+                self.assertEqual(
+                    ("L", expected, "R"),
+                    duckdb.connect().execute(
+                        compiled.sql, compiled.parameters
+                    ).fetchone(),
+                )
+
+    def test_in_place_transform_outputs_can_be_referenced_by_later_steps(self):
+        source_schema = [
+            ColumnSchema("src:left", "left_value", "왼쪽", "STRING", False, ("src:left",)),
+            ColumnSchema("src:middle", "middle_value", "가운데", "STRING", False, ("src:middle",)),
+            ColumnSchema("src:right", "right_value", "오른쪽", "STRING", False, ("src:right",)),
+        ]
+        compiled = compile_pipeline(
+            "SELECT 'L' AS left_value, '  jeonnam  ' AS middle_value, 'R' AS right_value",
+            source_schema,
+            {"steps": [
+                {"stepId": "trim", "type": "TRIM", "config": {
+                    "columnId": "src:middle", "mode": "BOTH", "outputId": "value",
+                }},
+                {"stepId": "upper", "type": "CHANGE_CASE", "config": {
+                    "columnId": "out:trim:value", "mode": "UPPER", "outputId": "value",
+                }},
+                {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "out:upper:value",
+                    "mappings": [{"from": "JEONNAM", "to": "01"}],
+                    "outputId": "value",
+                }},
+                {"stepId": "lookup", "type": "CODE_LOOKUP", "config": {
+                    "columnId": "out:replace:value",
+                    "values": [{"code": "01", "name": "전남"}],
+                    "outputId": "value",
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(
+            ["src:left", "out:lookup:value", "src:right"],
+            [column.column_id for column in compiled.output_schema],
+        )
+        self.assertEqual(
+            ("TRIM", "CHANGE_CASE", "REPLACE_VALUE", "CODE_LOOKUP"),
+            compiled.output_schema[1].operations,
+        )
+        self.assertEqual(
+            ("L", "전남", "R"),
+            duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone(),
+        )
+
+    def test_cast_then_replace_value_chains_on_the_same_column(self):
+        compiled = compile_pipeline(
+            "SELECT '42' AS value",
+            [
+                ColumnSchema(
+                    "src:value",
+                    "value",
+                    "값",
+                    "STRING",
+                    False,
+                    ("src:value",),
+                )
+            ],
+            {"steps": [
+                {"stepId": "cast", "type": "CAST", "config": {
+                    "columnId": "src:value",
+                    "targetType": "INT64",
+                    "outputId": "value",
+                }},
+                {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "out:cast:value",
+                    # 화면의 일반 입력 필드가 보내는 문자열 값도 INT64 문맥에서 변환된다.
+                    "mappings": [{"from": "42", "to": "100"}],
+                    "outputId": "value",
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(["out:replace:value"], [
+            column.column_id for column in compiled.output_schema
+        ])
+        self.assertEqual("INT64", compiled.output_schema[0].data_type)
+        self.assertEqual(
+            ("CAST", "REPLACE_VALUE"),
+            compiled.output_schema[0].operations,
+        )
+        self.assertEqual(
+            (100,),
+            duckdb.connect().execute(
+                compiled.sql, compiled.parameters
+            ).fetchone(),
+        )
+
+    def test_replace_value_uses_declared_order_against_the_original_value(self):
+        compiled = compile_pipeline(
+            "SELECT * FROM (VALUES ('전남'), ('조대'), ('전남조대')) t(department)",
+            [
+                ColumnSchema(
+                    "src:department",
+                    "department",
+                    "기관",
+                    "STRING",
+                    False,
+                    ("src:department",),
+                )
+            ],
+            {"steps": [
+                {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "src:department",
+                    "matchMode": "CONTAINS",
+                    "mappings": [
+                        {"from": "전남", "to": "그럴"},
+                        {"from": "조대", "to": "럴지도"},
+                    ],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        rows = duckdb.connect().execute(
+            compiled.sql, compiled.parameters
+        ).fetchall()
+        self.assertEqual([("그럴",), ("럴지도",), ("그럴",)], rows)
+        self.assertEqual(["%전남%", "그럴", "%조대%", "럴지도"], compiled.parameters)
+
+    def test_replace_value_does_not_rematch_a_previous_mapping_result(self):
+        compiled = compile_pipeline(
+            "SELECT * FROM (VALUES ('전남'), ('조대')) t(department)",
+            [
+                ColumnSchema(
+                    "src:department",
+                    "department",
+                    "기관",
+                    "STRING",
+                    False,
+                    ("src:department",),
+                )
+            ],
+            {"steps": [
+                {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                    "columnId": "src:department",
+                    "mappings": [
+                        {"from": "전남", "to": "조대"},
+                        {"from": "조대", "to": "럴지도"},
+                    ],
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        rows = duckdb.connect().execute(
+            compiled.sql, compiled.parameters
+        ).fetchall()
+        self.assertEqual([("조대",), ("럴지도",)], rows)
+
+    def test_replace_value_contains_rejects_blank_or_non_string_source_values(self):
+        source_schema = [
+            ColumnSchema(
+                "src:department",
+                "department",
+                "기관",
+                "STRING",
+                False,
+                ("src:department",),
+            )
+        ]
+        for invalid_value in (None, "", " ", 0):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"REPLACE_VALUE_CONTAINS_VALUE_REQUIRED: mappings\[0\]\.from",
+                ):
+                    compile_pipeline(
+                        "SELECT '전남' AS department",
+                        source_schema,
+                        {"steps": [
+                            {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                                "columnId": "src:department",
+                                "matchMode": "CONTAINS",
+                                "mappings": [{"from": invalid_value, "to": "변경"}],
+                            }},
+                            {"stepId": "output", "type": "OUTPUT", "config": {}},
+                        ]},
+                    )
+
+    def test_replace_value_distinguishes_string_zero_and_empty_exact_value(self):
+        source_schema = [
+            ColumnSchema(
+                "src:department",
+                "department",
+                "기관",
+                "STRING",
+                False,
+                ("src:department",),
+            )
+        ]
+        cases = [
+            (
+                "SELECT 'A0B' AS department",
+                "CONTAINS",
+                "0",
+                "문자열 영",
+            ),
+            (
+                "SELECT '' AS department",
+                "EXACT",
+                "",
+                "빈 문자열",
+            ),
+        ]
+        for source_sql, match_mode, source_value, expected in cases:
+            with self.subTest(match_mode=match_mode):
+                compiled = compile_pipeline(
+                    source_sql,
+                    source_schema,
+                    {"steps": [
+                        {"stepId": "replace", "type": "REPLACE_VALUE", "config": {
+                            "columnId": "src:department",
+                            "matchMode": match_mode,
+                            "mappings": [{"from": source_value, "to": expected}],
+                        }},
+                        {"stepId": "output", "type": "OUTPUT", "config": {}},
+                    ]},
+                )
+                self.assertEqual(
+                    (expected,),
+                    duckdb.connect().execute(
+                        compiled.sql, compiled.parameters
+                    ).fetchone(),
+                )
 
     def test_key_based_deduplicate_keeps_one_row_without_an_order_choice(self):
         compiled = compile_pipeline(
@@ -256,6 +551,7 @@ class TransformCompilerTest(unittest.TestCase):
             ["STRING", "INT64", "STRING"],
             [column.data_type for column in compiled.output_schema],
         )
+        self.assertEqual("가운데", compiled.output_schema[1].label)
 
         result = duckdb.connect().execute(compiled.sql, compiled.parameters)
         self.assertEqual(
@@ -265,7 +561,7 @@ class TransformCompilerTest(unittest.TestCase):
         self.assertEqual(["VARCHAR", "BIGINT", "VARCHAR"], [str(description[1]) for description in result.description])
         self.assertEqual(("L", 42, "R"), result.fetchone())
 
-    def test_cast_keep_input_preserves_the_source_and_appends_the_derived_column(self):
+    def test_cast_keep_input_is_accepted_but_still_replaces_the_source(self):
         source_schema = [
             ColumnSchema("src:left", "left_value", "왼쪽", "STRING", False, ("src:left",)),
             ColumnSchema("src:middle", "middle_value", "가운데", "STRING", False, ("src:middle",)),
@@ -286,7 +582,7 @@ class TransformCompilerTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["src:left", "src:middle", "src:right", "out:cast-middle:integer"],
+            ["src:left", "out:cast-middle:integer", "src:right"],
             [column.column_id for column in compiled.output_schema],
         )
         result = duckdb.connect().execute(compiled.sql, compiled.parameters)
@@ -295,10 +591,10 @@ class TransformCompilerTest(unittest.TestCase):
             [description[0] for description in result.description],
         )
         self.assertEqual(
-            ["VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"],
+            ["VARCHAR", "BIGINT", "VARCHAR"],
             [str(description[1]) for description in result.description],
         )
-        self.assertEqual(("L", "42", "R", 42), result.fetchone())
+        self.assertEqual(("L", 42, "R"), result.fetchone())
 
     def test_cast_parses_compact_date_and_timestamp_formats(self):
         cases = [
@@ -441,6 +737,90 @@ class TransformCompilerTest(unittest.TestCase):
         row = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()
         self.assertEqual(20140522, row[1])
         self.assertEqual("2014", row[-1])
+
+    def test_declared_creation_transforms_keep_inputs_and_add_results(self):
+        cases = [
+            (
+                "SPLIT_COLUMN",
+                {
+                    "inputColumnId": "src:department",
+                    "delimiter": "-",
+                    "outputs": [
+                        {"outputId": "first", "label": "첫 값"},
+                        {"outputId": "second", "label": "둘째 값"},
+                    ],
+                },
+                ["out:work:first", "out:work:second"],
+            ),
+            (
+                "MERGE_COLUMNS",
+                {
+                    "inputColumnIds": ["src:department", "src:patient"],
+                    "delimiter": "-",
+                    "output": {"outputId": "merged", "label": "합친 값"},
+                },
+                ["out:work:merged"],
+            ),
+            (
+                "CALCULATE",
+                {
+                    "expression": {
+                        "op": "ADD",
+                        "args": [
+                            {"op": "COLUMN", "columnId": "src:amount"},
+                            {"op": "LITERAL", "value": 1, "dataType": "INT64"},
+                        ],
+                    },
+                    "outputId": "calculated",
+                    "label": "계산 결과",
+                },
+                ["out:work:calculated"],
+            ),
+        ]
+
+        for step_type, config, generated_ids in cases:
+            with self.subTest(step_type=step_type):
+                compiled = compile_pipeline(
+                    "SELECT 'A-B' AS department, 10 AS amount, 'p1' AS patient_id",
+                    SOURCE,
+                    {"steps": [
+                        {"stepId": "work", "type": step_type, "config": config},
+                        {"stepId": "output", "type": "OUTPUT", "config": {}},
+                    ]},
+                )
+                self.assertEqual(
+                    [
+                        "src:department",
+                        "src:amount",
+                        "src:patient",
+                        *generated_ids,
+                    ],
+                    [column.column_id for column in compiled.output_schema],
+                )
+
+    def test_row_number_is_created_before_every_existing_column(self):
+        compiled = compile_pipeline(
+            "SELECT 'A' AS department, 10 AS amount, 'p1' AS patient_id",
+            SOURCE,
+            {"steps": [
+                {"stepId": "number", "type": "ROW_NUMBER", "config": {
+                    "orderBy": [{"columnId": "src:amount", "direction": "ASC"}],
+                    "output": {"outputId": "rn", "label": "행 번호"},
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(
+            ["out:number:rn", "src:department", "src:amount", "src:patient"],
+            [column.column_id for column in compiled.output_schema],
+        )
+        result = duckdb.connect().execute(compiled.sql, compiled.parameters)
+        self.assertEqual(
+            [column.physical_name for column in compiled.output_schema],
+            [description[0] for description in result.description],
+        )
+        self.assertEqual((1, "A", 10, "p1"), result.fetchone())
 
     def test_each_supported_transform_compiles_to_executable_duckdb_sql(self):
         source = "SELECT * FROM (VALUES (' A ',10,'x'),(NULL,20,'y'),('B',10,'x')) t(department,amount,patient_id)"

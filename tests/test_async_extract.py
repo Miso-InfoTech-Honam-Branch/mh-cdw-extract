@@ -220,9 +220,9 @@ class AsyncExtractTest(unittest.TestCase):
                 ).fetchone()
             finally:
                 connection.close()
-            self.assertEqual((" Seoul ", 100, "Seoul"), result)
-            self.assertEqual(["지역","금액","지역"],[column["name"] for column in job["resultColumns"]])
-            self.assertEqual("city",job["resultColumns"][0]["originalName"])
+            self.assertEqual(("Seoul", 100), result)
+            self.assertEqual(["지역","금액"],[column["name"] for column in job["resultColumns"]])
+            self.assertRegex(job["resultColumns"][0]["originalName"], r"^c_[0-9a-f]{12}$")
             self.assertEqual([], list(Path(job["filePath"]).parent.glob("*.tmp")))
 
     def test_runner_publishes_reusable_user_dataset_and_sends_exact_callback(self):
