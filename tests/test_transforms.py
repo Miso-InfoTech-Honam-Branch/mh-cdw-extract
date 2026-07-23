@@ -228,6 +228,78 @@ class TransformCompilerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"final active step"):
             compile_pipeline("SELECT * FROM source",SOURCE,{"steps":[]})
 
+    def test_cast_replaces_a_middle_column_without_changing_its_position(self):
+        source_schema = [
+            ColumnSchema("src:left", "left_value", "왼쪽", "STRING", False, ("src:left",)),
+            ColumnSchema("src:middle", "middle_value", "가운데", "STRING", False, ("src:middle",)),
+            ColumnSchema("src:right", "right_value", "오른쪽", "STRING", False, ("src:right",)),
+        ]
+        compiled = compile_pipeline(
+            "SELECT 'L' AS left_value, '42' AS middle_value, 'R' AS right_value",
+            source_schema,
+            {"steps": [
+                {"stepId": "cast-middle", "type": "CAST", "config": {
+                    "columnId": "src:middle",
+                    "targetType": "INT64",
+                    "outputId": "integer",
+                    "keepInput": False,
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(
+            ["src:left", "out:cast-middle:integer", "src:right"],
+            [column.column_id for column in compiled.output_schema],
+        )
+        self.assertEqual(
+            ["STRING", "INT64", "STRING"],
+            [column.data_type for column in compiled.output_schema],
+        )
+
+        result = duckdb.connect().execute(compiled.sql, compiled.parameters)
+        self.assertEqual(
+            [column.physical_name for column in compiled.output_schema],
+            [description[0] for description in result.description],
+        )
+        self.assertEqual(["VARCHAR", "BIGINT", "VARCHAR"], [str(description[1]) for description in result.description])
+        self.assertEqual(("L", 42, "R"), result.fetchone())
+
+    def test_cast_keep_input_preserves_the_source_and_appends_the_derived_column(self):
+        source_schema = [
+            ColumnSchema("src:left", "left_value", "왼쪽", "STRING", False, ("src:left",)),
+            ColumnSchema("src:middle", "middle_value", "가운데", "STRING", False, ("src:middle",)),
+            ColumnSchema("src:right", "right_value", "오른쪽", "STRING", False, ("src:right",)),
+        ]
+        compiled = compile_pipeline(
+            "SELECT 'L' AS left_value, '42' AS middle_value, 'R' AS right_value",
+            source_schema,
+            {"steps": [
+                {"stepId": "cast-middle", "type": "CAST", "config": {
+                    "columnId": "src:middle",
+                    "targetType": "INT64",
+                    "outputId": "integer",
+                    "keepInput": True,
+                }},
+                {"stepId": "output", "type": "OUTPUT", "config": {}},
+            ]},
+        )
+
+        self.assertEqual(
+            ["src:left", "src:middle", "src:right", "out:cast-middle:integer"],
+            [column.column_id for column in compiled.output_schema],
+        )
+        result = duckdb.connect().execute(compiled.sql, compiled.parameters)
+        self.assertEqual(
+            [column.physical_name for column in compiled.output_schema],
+            [description[0] for description in result.description],
+        )
+        self.assertEqual(
+            ["VARCHAR", "VARCHAR", "VARCHAR", "BIGINT"],
+            [str(description[1]) for description in result.description],
+        )
+        self.assertEqual(("L", "42", "R", 42), result.fetchone())
+
     def test_cast_parses_compact_date_and_timestamp_formats(self):
         cases = [
             ("20140522", "DATE", "YYYYMMDD", "2014-05-22"),
@@ -246,7 +318,60 @@ class TransformCompilerTest(unittest.TestCase):
                         {"stepId": "output", "type": "OUTPUT", "config": {}},
                     ]},
                 )
-                value = duckdb.connect().execute(compiled.sql, compiled.parameters).fetchone()[-1]
+                cast_index = next(
+                    index
+                    for index, column in enumerate(compiled.output_schema)
+                    if column.column_id == "out:cast:cast"
+                )
+                value = duckdb.connect().execute(
+                    compiled.sql, compiled.parameters
+                ).fetchone()[cast_index]
+                self.assertEqual(expected, str(value))
+
+    def test_cast_parses_fractional_timezone_timestamp_string(self):
+        raw_value = "2026-02-11 15:18:49.120833+00:00"
+        cases = [
+            ("DATE", "", "2026-02-11"),
+            ("TIMESTAMP", "", "2026-02-11 15:18:49.120833"),
+            (
+                "TIMESTAMP_TZ",
+                "",
+                "2026-02-11 15:18:49.120833+00:00",
+            ),
+            (
+                "TIMESTAMP_TZ",
+                "ISO8601_TZ",
+                "2026-02-11 15:18:49.120833+00:00",
+            ),
+        ]
+        for target_type, input_format, expected in cases:
+            with self.subTest(target_type=target_type, input_format=input_format):
+                compiled = compile_pipeline(
+                    f"SELECT '{raw_value}' AS department, 1 AS amount, 'p1' AS patient_id",
+                    SOURCE,
+                    {"steps": [
+                        {"stepId": "cast", "type": "CAST", "config": {
+                            "columnId": "src:department",
+                            "targetType": target_type,
+                            "inputFormat": input_format,
+                            "onError": "NULL",
+                        }},
+                        {"stepId": "output", "type": "OUTPUT", "config": {}},
+                    ]},
+                )
+                connection = duckdb.connect()
+                try:
+                    connection.execute("SET TimeZone='UTC'")
+                    cast_index = next(
+                        index
+                        for index, column in enumerate(compiled.output_schema)
+                        if column.column_id == "out:cast:cast"
+                    )
+                    value = connection.execute(
+                        compiled.sql, compiled.parameters
+                    ).fetchone()[cast_index]
+                finally:
+                    connection.close()
                 self.assertEqual(expected, str(value))
 
     def test_cast_rejects_unknown_date_format(self):

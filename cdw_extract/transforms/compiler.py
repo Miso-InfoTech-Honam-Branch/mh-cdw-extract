@@ -341,13 +341,26 @@ class PipelineCompiler:
             "YYYY/MM/DD": "%Y/%m/%d",
             "YYYYMMDDHH24MISS": "%Y%m%d%H%M%S",
             "YYYY-MM-DD HH24:MI:SS": "%Y-%m-%d %H:%M:%S",
-            "ISO8601_TZ": "%Y-%m-%dT%H:%M:%S%z",
         }
         if input_format and target in {"DATE", "TIMESTAMP", "TIMESTAMP_TZ"}:
-            if input_format not in date_formats:
-                raise ValueError(f"unsupported CAST inputFormat: {input_format}")
-            parser = "strptime" if policy == "FAIL" else "try_strptime"
-            parsed = f"{parser}(CAST({quote_ident(source.physical_name)} AS VARCHAR), '{date_formats[input_format]}')"
+            if input_format == "ISO8601_TZ":
+                # ISO 8601은 T/공백 구분, 소수초 유무, Z 또는 +HH:MM 등
+                # 동등한 표현이 많으므로 DuckDB의 시간대 파서를 사용한다.
+                parser = "CAST" if policy == "FAIL" else "TRY_CAST"
+                parsed = (
+                    f"{parser}(CAST({quote_ident(source.physical_name)} AS VARCHAR) "
+                    "AS TIMESTAMPTZ)"
+                )
+            else:
+                if input_format not in date_formats:
+                    raise ValueError(
+                        f"unsupported CAST inputFormat: {input_format}"
+                    )
+                parser = "strptime" if policy == "FAIL" else "try_strptime"
+                parsed = (
+                    f"{parser}(CAST({quote_ident(source.physical_name)} AS VARCHAR), "
+                    f"'{date_formats[input_format]}')"
+                )
             cast = f"CAST({parsed} AS {duck_type})"
         else:
             cast = (
@@ -364,22 +377,24 @@ class PipelineCompiler:
             "CAST",
             nullable=source.nullable or policy != "FAIL",
         )
-        select = (
-            self.passthrough()
-            if config.get("keepInput", False)
-            else [
-                quote_ident(item.physical_name)
-                for item in self.schema
-                if item.column_id != source.column_id
-            ]
-        )
-        schema = (
-            list(self.schema)
-            if config.get("keepInput", False)
-            else [item for item in self.schema if item.column_id != source.column_id]
-        )
-        select.append(f"{cast} AS {quote_ident(output.physical_name)}")
-        schema.append(output)
+        keep_input = bool(config.get("keepInput", False))
+        if keep_input:
+            select = self.passthrough()
+            schema = list(self.schema)
+            select.append(f"{cast} AS {quote_ident(output.physical_name)}")
+            schema.append(output)
+        else:
+            # 원본 열을 제거하는 CAST는 열 위치까지 보존해야 후속 단계와 미리보기의
+            # 항목 순서가 사용자가 선택한 원본 순서에서 달라지지 않는다.
+            select = []
+            schema = []
+            for item in self.schema:
+                if item.column_id == source.column_id:
+                    select.append(f"{cast} AS {quote_ident(output.physical_name)}")
+                    schema.append(output)
+                else:
+                    select.append(quote_ident(item.physical_name))
+                    schema.append(item)
         warning_start = len(self.warnings)
         if policy == "DROP_ROW":
             relation_name = f"__cast_source_{len(self.step_schemas):03d}"
