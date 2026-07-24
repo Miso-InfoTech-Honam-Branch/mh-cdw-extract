@@ -75,6 +75,80 @@ class TransformCompilerTest(unittest.TestCase):
         )
         self.assertEqual(["신장","체중"],[column.label for column in compiled.output_schema])
 
+    def test_automatic_pivot_rejects_silent_truncation_above_the_value_limit(self):
+        rows = ", ".join(
+            f"('value-{index:03d}', 1, 'patient-{index:03d}')"
+            for index in range(101)
+        )
+        pipeline = {"pipelineVersion": 1, "steps": [
+            {
+                "stepId": "pivot",
+                "type": "PIVOT",
+                "config": {
+                    "groupColumnIds": [],
+                    "pivotColumnId": "src:department",
+                    "values": [],
+                    "aggregates": [{"aggregateId": "rows", "op": "COUNT_ROWS"}],
+                    "unknownValuePolicy": "IGNORE",
+                },
+            },
+            {"stepId": "output", "type": "OUTPUT", "config": {}},
+        ]}
+        connection = duckdb.connect()
+        try:
+            with self.assertRaisesRegex(ValueError, "PIVOT_TOO_MANY_VALUES"):
+                _resolve_automatic_pivot_values(
+                    connection,
+                    f"(VALUES {rows}) AS source(department, amount, patient_id)",
+                    SOURCE,
+                    pipeline,
+                )
+        finally:
+            connection.close()
+
+    def test_automatic_pivot_other_uses_top_values_and_preserves_the_remainder(self):
+        categories = [f"value-{index:03d}" for index in range(102)]
+        rows = [
+            *(f"('{category}', 1, 'patient-{index:03d}')" for index, category in enumerate(categories)),
+            "('value-101', 1, 'patient-extra-1')",
+            "('value-101', 1, 'patient-extra-2')",
+        ]
+        source = f"(VALUES {', '.join(rows)}) AS source(department, amount, patient_id)"
+        pipeline = {"pipelineVersion": 1, "steps": [
+            {
+                "stepId": "pivot",
+                "type": "PIVOT",
+                "config": {
+                    "groupColumnIds": [],
+                    "pivotColumnId": "src:department",
+                    "values": [],
+                    "aggregates": [{"aggregateId": "rows", "op": "COUNT_ROWS"}],
+                    "unknownValuePolicy": "OTHER",
+                },
+            },
+            {"stepId": "output", "type": "OUTPUT", "config": {}},
+        ]}
+        connection = duckdb.connect()
+        try:
+            resolved, resolved_hash = _resolve_automatic_pivot_values(
+                connection, source, SOURCE, pipeline
+            )
+            values = resolved["steps"][0]["config"]["values"]
+            self.assertEqual(100, len(values))
+            self.assertEqual("value-101", values[0]["value"])
+            self.assertEqual(
+                {"valueId": "__other__", "value": None, "label": "기타", "sort": 100},
+                values[-1],
+            )
+            self.assertEqual(resolved_hash, canonical_hash(resolved))
+
+            compiled = compile_pipeline(f"SELECT * FROM {source}", SOURCE, resolved)
+            result = connection.execute(compiled.sql, compiled.parameters).fetchone()
+            self.assertEqual(3, result[0])
+            self.assertEqual(3, result[-1])
+        finally:
+            connection.close()
+
     def test_automatic_pivot_normalizes_non_json_duckdb_scalars(self):
         cases = [
             ("DECIMAL(10,2)", "CAST(1.20 AS DECIMAL(10,2))", Decimal("1.20"), "1.20"),

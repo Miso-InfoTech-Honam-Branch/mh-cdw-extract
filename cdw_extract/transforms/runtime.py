@@ -108,6 +108,14 @@ def _resolve_automatic_pivot_values(
         )
         if pivot_column is None:
             raise ValueError("PIVOT_COLUMN_NOT_FOUND")
+        unknown_policy = str(config.get("unknownValuePolicy") or "IGNORE").upper()
+        include_other = unknown_policy == "OTHER"
+        # OTHER is an explicit, lossless opt-in for high-cardinality pivots. Keep
+        # one of the bounded output slots for the catch-all column and choose the
+        # remaining values deterministically by frequency. IGNORE and FAIL must
+        # still discover every value; silently truncating either policy would
+        # change the requested result without the caller's consent.
+        discovery_limit = MAX_PIVOT_VALUES - 1 if include_other else MAX_PIVOT_VALUES + 1
         code_name_physical = None
         for mapping in code_mappings or []:
             source_matches = any(
@@ -121,11 +129,24 @@ def _resolve_automatic_pivot_values(
             if source_matches:
                 code_name_physical = mapping.get("outputColumn")
                 break
-        if code_name_physical:
+        if code_name_physical and include_other:
+            discovery_sql = (
+                f"SELECT {quote_ident(pivot_column.physical_name)} AS __pivot_value, "
+                f"max({quote_ident(code_name_physical)}) AS __pivot_label FROM ({compiled_prefix.sql}) AS __pivot_source "
+                f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL GROUP BY 1 "
+                f"ORDER BY count(*) DESC, 1 LIMIT {discovery_limit}"
+            )
+        elif code_name_physical:
             discovery_sql = (
                 f"SELECT {quote_ident(pivot_column.physical_name)} AS __pivot_value, "
                 f"max({quote_ident(code_name_physical)}) AS __pivot_label FROM ({compiled_prefix.sql}) AS __pivot_source "
                 f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT {MAX_PIVOT_VALUES + 1}"
+            )
+        elif include_other:
+            discovery_sql = (
+                f"SELECT {quote_ident(pivot_column.physical_name)} AS __pivot_value FROM ({compiled_prefix.sql}) AS __pivot_source "
+                f"WHERE {quote_ident(pivot_column.physical_name)} IS NOT NULL GROUP BY 1 "
+                f"ORDER BY count(*) DESC, 1 LIMIT {discovery_limit}"
             )
         else:
             discovery_sql = (
@@ -136,9 +157,11 @@ def _resolve_automatic_pivot_values(
             discovery_sql,
             compiled_prefix.parameters,
         ).fetchall()
-        if len(result) > MAX_PIVOT_VALUES:
+        if not include_other and len(result) > MAX_PIVOT_VALUES:
             raise ValueError(
-                f"PIVOT_TOO_MANY_VALUES: 고유값이 {MAX_PIVOT_VALUES}개를 초과하여 가로로 펼칠 수 없습니다."
+                f"PIVOT_TOO_MANY_VALUES: 고유값이 {MAX_PIVOT_VALUES}개를 초과하여 "
+                "가로로 펼칠 수 없습니다. 값을 직접 선택하거나 미등록값 처리 정책을 "
+                "OTHER로 설정해 주세요."
             )
         if not result:
             raise ValueError("PIVOT_NO_VALUES: 가로로 펼칠 값이 없습니다.")
@@ -153,6 +176,15 @@ def _resolve_automatic_pivot_values(
                     if len(row) > 1 and row[1] is not None and str(row[1]).strip()
                     else str(wire_value),
                     "sort": order,
+                }
+            )
+        if include_other:
+            resolved_values.append(
+                {
+                    "valueId": "__other__",
+                    "value": None,
+                    "label": "기타",
+                    "sort": len(resolved_values) + 1,
                 }
             )
         config["values"] = resolved_values
