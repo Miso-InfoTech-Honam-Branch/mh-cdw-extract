@@ -18,6 +18,8 @@ class StrictModel(BaseModel):
 class ChartType(str, Enum):
     """지원하는 분석 차트 유형이다."""
 
+    KPI = "KPI"
+    TABLE = "TABLE"
     BAR = "BAR"
     PIE = "PIE"
     LINE = "LINE"

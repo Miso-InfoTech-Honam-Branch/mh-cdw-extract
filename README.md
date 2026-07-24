@@ -83,14 +83,16 @@ raw SQL, functions, and expressions are not accepted.
 }
 ```
 
-Supported charts are `BAR`, `PIE`, `LINE`, `SCATTER`, `BOXPLOT`, `FUNNEL`,
-`SANKEY`, and `TREEMAP`. Aggregations are `COUNT`, `COUNT_DISTINCT`, `SUM`,
+Supported charts are `KPI`, `TABLE`, `BAR`, `PIE`, `LINE`, `SCATTER`, `BOXPLOT`,
+`FUNNEL`, `SANKEY`, and `TREEMAP`. Aggregations are `COUNT`, `COUNT_DISTINCT`, `SUM`,
 `AVG`, `MIN`, `MAX`, and `MEDIAN`; time grains are `DAY`, `WEEK`, `MONTH`,
 `QUARTER`, and `YEAR`. Filters support `EQ`, `NE`, `GT`, `GTE`, `LT`, `LTE`,
 `IN`, `CONTAINS`, `BETWEEN`, `IS_NULL`, and `IS_NOT_NULL`.
 
 | chartType | Required/optional encoding roles | Row keys |
 | --- | --- | --- |
+| `KPI` | aggregated `value` only | `value` |
+| `TABLE` | `category`; optional `value`, `series` | `category`, `value`, optional `series` |
 | `BAR`, `PIE`, `LINE` | `category`; optional `value`, `series` | `category`, `value`, optional `series` |
 | `SCATTER` | `x`, `y`; optional `size`, `series` | `x`, `y`, optional `size`, `series` |
 | `BOXPLOT` | `value`; optional `group` (defaults to `All`) | `category`, `count`, `min`, `q1`, `median`, `q3`, `max`, `lowerFence`, `upperFence`, `outlierCount` |
@@ -98,14 +100,17 @@ Supported charts are `BAR`, `PIE`, `LINE`, `SCATTER`, `BOXPLOT`, `FUNNEL`,
 | `SANKEY` | `source`, `target`; optional `value` | `source`, `target`, `value` |
 | `TREEMAP` | `hierarchy` with 1-3 fields; optional `value` | `level0`...`levelN`, `value` |
 
-For grouped charts, an omitted `value` means `COUNT(*)`; a value column with no
+`KPI` requires an explicit aggregation on `value` and produces exactly one row
+for the complete filtered source. It does not accept category roles, sorting,
+Top N, drilldown, comparison, Others, or value transforms. For grouped charts,
+including `TABLE`, an omitted `value` means `COUNT(*)`; a value column with no
 aggregation defaults to `SUM`. `COUNT` may omit its column. `timeGrain` is valid
 only on `DATE`/`TIMESTAMP` dimensions. Sankey node IDs are normalized to strings,
 and self-links are excluded by default.
 
 Typed options include `nullPolicy`, `includeOthers`, `othersLabel`,
 `excludeSelfLinks`, `scatterSampleSize`, `randomSeed`, `memoryLimitMb`, `threads`,
-and `timeoutMs`. `includeOthers` is limited to `BAR`/`PIE`/`FUNNEL` with additive
+and `timeoutMs`. `includeOthers` is limited to `TABLE`/`BAR`/`PIE`/`FUNNEL` with additive
 `COUNT`/`SUM`, no series, and `limit >= 2`; a label that collides with real data
 is rejected. Presentation-only options are not part of the worker DSL and must
 be removed by the caller.
@@ -131,13 +136,15 @@ be removed by the caller.
 ```
 
 The service re-reads the Parquet schema, validates every referenced column and
-role, quotes identifiers, and binds filter values. Defaults cap source files at
-256 MiB, results at 2,000 rows, DuckDB memory at 256 MiB, execution at 5 seconds,
-and scatter reservoir samples at 1,000 points. Sources up to 3 GiB are analyzed in full;
-larger Parquet sources are analyzed from a proportional leading row slice. `ANALYTICS_MAX_SOURCE_BYTES` can
-set the deployment source-file cap. Any omitted result rows set `truncated=true`
-and add a warning; dates are ISO strings and non-finite numbers become JSON null
-with a warning.
+role, quotes identifiers, and binds filter values. Every published Parquet source
+is scanned in full for exact aggregates; source size never causes a leading-row
+slice. Defaults cap results at 2,000 rows, DuckDB memory at 256 MiB, execution at
+5 seconds, and scatter reservoir samples at 1,000 points. The resource governor
+and query timeout remain authoritative for large workloads. The source version is
+checked again after execution, so a refresh during a query fails with a retryable
+error instead of returning a mixed snapshot. Any omitted result
+rows set `truncated=true` and add a warning; dates are ISO strings and non-finite
+numbers become JSON null with a warning.
 
 Invalid request shapes/enums return FastAPI `422` validation details. A valid
 shape that violates chart roles, source columns, or type compatibility returns
@@ -421,10 +428,13 @@ The accepted response is:
 ```
 
 PNG and PDF render every dashboard panel with Matplotlib's headless backend;
-XLSX contains the dashboard image and one data sheet per chart. The renderer
-supports all eight chart types, discovers Malgun Gothic/Noto Sans CJK/Nanum
+XLSX contains the dashboard image and one data sheet per chart. KPI panels render
+a large formatted number, while TABLE panels render a compact tabular preview.
+The renderer supports all ten chart types, discovers Malgun Gothic/Noto Sans CJK/Nanum
 fonts, records a manifest warning if no CJK font is available, and replaces an
 individual broken panel with an error panel without corrupting other charts.
+Multi-chart files require one consistent `sourceVersion`; a refresh between charts
+fails the job, while query and truncation warnings are retained in `renderWarnings`.
 For each compiled query, the renderer matches `queries[].chartId` to the raw
 `dashboard.charts[].chartId` and applies the saved display options to every
 format: `palette` (`PROFESSIONAL`, `OCEAN`, `WARM`, or `ACCESSIBLE`),

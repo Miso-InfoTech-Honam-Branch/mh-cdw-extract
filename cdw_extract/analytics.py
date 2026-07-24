@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import threading
 import time
 import uuid
@@ -26,23 +25,12 @@ from cdw_extract.duck import connect
 from cdw_extract.query import SourceResolver
 
 
-DEFAULT_MAX_SOURCE_BYTES = 3 * 1024 * 1024 * 1024
-
-
-def _max_source_bytes() -> int:
-    raw = os.environ.get("ANALYTICS_MAX_SOURCE_BYTES")
-    if not raw:
-        return DEFAULT_MAX_SOURCE_BYTES
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("ANALYTICS_MAX_SOURCE_BYTES must be an integer") from exc
-    if value < 1:
-        raise ValueError("ANALYTICS_MAX_SOURCE_BYTES must be positive")
-    return value
-
-
-def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRequest | AnalyticsDetailRequest) -> str:
+def _source_version(
+    manifest: dict,
+    source_path: Path,
+    request: AnalyticsQueryRequest | AnalyticsDetailRequest,
+    resolved_root: Path,
+) -> str:
     material = {
         "sourceKind": request.source.source_kind,
         "userId": request.source.user_id,
@@ -55,7 +43,10 @@ def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRe
         "requestId": manifest.get("requestId"),
         "createdAt": manifest.get("createdAt"),
         "completedAt": manifest.get("completedAt"),
+        "snapshotId": manifest.get("snapshotId"),
+        "updatedAt": manifest.get("updatedAt"),
         "path": manifest.get("path"),
+        "resolvedPath": source_path.relative_to(resolved_root).as_posix(),
     }
     if not material["sha256Checksum"]:
         stat = source_path.stat()
@@ -68,7 +59,7 @@ def _source_version(manifest: dict, source_path: Path, request: AnalyticsQueryRe
 def _resolve_source(
     request: AnalyticsQueryRequest | AnalyticsDetailRequest,
     data_root: str | Path,
-) -> tuple[Path, dict, str, int]:
+) -> tuple[Path, dict, str]:
     source = request.source
     resolver = SourceResolver(source.metadata_id or "", data_root)
     source_reference = source.model_dump(by_alias=True)
@@ -82,27 +73,24 @@ def _resolve_source(
         raise ValueError("resolved analytics source must remain beneath DATA_ROOT")
     manifest = (resolver.connection_manifest() if source.source_kind == "MTDT_TBL" else
                 resolver.user_dataset_file_manifest(source.user_id, source.user_dataset_id, source.user_dataset_file_id))
-    size = source_path.stat().st_size
-    return source_path, manifest, _source_version(manifest, source_path, request), size
-
-
-def _source_slice(connection, source_path: Path, source_bytes: int) -> tuple[int | None, str | None]:
-    maximum = _max_source_bytes()
-    if source_bytes <= maximum:
-        return None, None
-    row = connection.execute(
-        "SELECT coalesce(sum(row_group_num_rows), 0) FROM parquet_metadata(?)",
-        [source_path.as_posix()],
-    ).fetchone()
-    total_rows = int(row[0] or 0)
-    if total_rows < 1:
-        raise ValueError("source Parquet contains no rows")
-    selected_rows = max(1, min(total_rows, int(total_rows * maximum / source_bytes)))
-    warning = (
-        f"Source Parquet is larger than the {maximum}-byte analytics cap; "
-        f"the first {selected_rows:,} of {total_rows:,} rows were analyzed."
+    return source_path, manifest, _source_version(
+        manifest,
+        source_path,
+        request,
+        resolved_root,
     )
-    return selected_rows, warning
+
+
+def _ensure_source_unchanged(
+    request: AnalyticsQueryRequest | AnalyticsDetailRequest,
+    data_root: str | Path,
+    expected_version: str,
+) -> None:
+    """Fail closed when a mutable source pointer changes during execution."""
+
+    _source_path, _manifest, current_version = _resolve_source(request, data_root)
+    if current_version != expected_version:
+        raise RuntimeError("analytics source changed during analysis; retry")
 
 
 def _json_value(value: object, warnings: list[str]) -> object:
@@ -198,19 +186,18 @@ def run_analytics_query(
     """분석 요청을 컴파일·실행하고 JSON 안전한 차트 결과를 반환한다."""
 
     started = time.perf_counter()
-    source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
+    source_path, _manifest, source_version = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics", request.request_id)
     try:
         options = request.options
         _apply_connection_limits(connection, options)
         connection.execute("SET preserve_insertion_order=false")
-        source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)",
             [source_path.as_posix()],
         ).fetchall()
         schema = [(str(row[0]), str(row[1])) for row in schema_rows]
-        compiled = AnalyticsCompiler(request, source_path, schema, source_row_limit).compile()
+        compiled = AnalyticsCompiler(request, source_path, schema).compile()
         names, raw_rows = _fetch_with_timeout(
             connection,
             compiled.sql,
@@ -219,6 +206,8 @@ def run_analytics_query(
         )
     finally:
         connection.close()
+
+    _ensure_source_unchanged(request, data_root, source_version)
 
     if compiled.others_label and "__label_collision" in names:
         collision_index = names.index("__label_collision")
@@ -233,8 +222,6 @@ def run_analytics_query(
         raw_rows = [tuple(row[index] for index in visible_indices) for row in raw_rows]
 
     warnings = list(compiled.warnings)
-    if source_warning:
-        warnings.append(source_warning)
     result_truncated = compiled.detect_truncation and len(raw_rows) > compiled.row_limit
     if len(raw_rows) > compiled.row_limit:
         raw_rows = raw_rows[: compiled.row_limit]
@@ -275,9 +262,6 @@ def run_analytics_query(
         "appliedFilterCount": len(request.all_filters),
         "valueTransform": request.options.value_transform.value,
     }
-    if source_row_limit is not None:
-        metadata["sourceTruncated"] = True
-        metadata["analyzedSourceRows"] = source_row_limit
     if request.top_n and request.top_n.enabled:
         metadata["topN"] = request.top_n.model_dump(by_alias=True, mode="json")
     if request.drilldown:
@@ -295,7 +279,7 @@ def run_analytics_query(
         sourceVersion=source_version,
         elapsedMs=elapsed_ms,
         rowCount=len(rows),
-        truncated=result_truncated or source_row_limit is not None,
+        truncated=result_truncated,
         warnings=warnings,
         columns=compiled.columns,
         rows=rows,
@@ -311,18 +295,17 @@ def run_analytics_detail(
     """선택한 분석 지점에 대응하는 원본 상세 행을 조회한다."""
 
     started = time.perf_counter()
-    source_path, _manifest, source_version, source_bytes = _resolve_source(request, data_root)
+    source_path, _manifest, source_version = _resolve_source(request, data_root)
     connection = connect(data_root, "analytics-detail", request.request_id)
     try:
         options = request.options
         _apply_connection_limits(connection, options)
         connection.execute("SET preserve_insertion_order=false")
-        source_row_limit, source_warning = _source_slice(connection, source_path, source_bytes)
         schema_rows = connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)", [source_path.as_posix()]
         ).fetchall()
         schema = [(str(row[0]), str(row[1])) for row in schema_rows]
-        compiled = AnalyticsDetailCompiler(request, source_path, schema, source_row_limit).compile()
+        compiled = AnalyticsDetailCompiler(request, source_path, schema).compile()
         names, raw_rows = _fetch_with_timeout(
             connection,
             compiled.sql,
@@ -332,11 +315,11 @@ def run_analytics_detail(
     finally:
         connection.close()
 
+    _ensure_source_unchanged(request, data_root, source_version)
+
     has_more = len(raw_rows) > compiled.row_limit
     raw_rows = raw_rows[: compiled.row_limit]
     warnings: list[str] = []
-    if source_warning:
-        warnings.append(source_warning)
     rows = [
         {name: _json_value(value, warnings) for name, value in zip(names, raw_row)}
         for raw_row in raw_rows

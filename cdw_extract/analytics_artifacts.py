@@ -563,6 +563,90 @@ def _axis_rotation(options: dict[str, object], category_count: int) -> int:
     return 0
 
 
+def _render_kpi(ax, response, font, options: dict[str, object]) -> None:
+    row = response.rows[0]
+    value = row.get("value")
+    display = "—" if value is None else _format_number(value, options)
+    font_size = 34 if len(display) <= 12 else 28 if len(display) <= 20 else 22
+    label = response.columns[0].label if response.columns else "Value"
+    colors = list(options["colors"])
+    ax.text(
+        0.5,
+        0.57,
+        display,
+        ha="center",
+        va="center",
+        color=colors[0],
+        fontproperties=font,
+        fontsize=font_size,
+        fontweight="bold",
+    )
+    ax.text(
+        0.5,
+        0.32,
+        label,
+        ha="center",
+        va="center",
+        fontproperties=font,
+        fontsize=9,
+        color="#475569",
+    )
+    ax.axis("off")
+
+
+def _table_cell(value: object, options: dict[str, object]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return _format_number(value, options)
+    text = str(value)
+    return text if len(text) <= 48 else text[:45] + "..."
+
+
+def _render_table(ax, response, font, options: dict[str, object]) -> None:
+    maximum_rows = 30
+    rows = response.rows[:maximum_rows]
+    columns = response.columns
+    headers = [column.label for column in columns]
+    cell_text = [
+        [_table_cell(row.get(column.key), options) for column in columns]
+        for row in rows
+    ]
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=headers,
+        cellLoc="left",
+        colLoc="left",
+        loc="center",
+        bbox=[0, 0.08, 1, 0.88],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    header_color = list(options["colors"])[0]
+    for (row_index, _column_index), cell in table.get_celld().items():
+        cell.get_text().set_fontproperties(font)
+        if row_index == 0:
+            cell.set_facecolor(header_color)
+            cell.get_text().set_color("white")
+            cell.get_text().set_weight("bold")
+        elif row_index % 2 == 0:
+            cell.set_facecolor("#F8FAFC")
+    if len(response.rows) > maximum_rows:
+        ax.text(
+            0,
+            0.01,
+            f"Showing first {maximum_rows} of {len(response.rows)} rows",
+            ha="left",
+            va="bottom",
+            fontproperties=font,
+            fontsize=7,
+            color="#64748B",
+        )
+    ax.axis("off")
+
+
 def _render_category(ax, chart_type: str, rows: list[dict], font, options: dict[str, object]) -> None:
     import numpy as np
 
@@ -775,6 +859,10 @@ def _render_chart(ax, chart_type: str, response, title: str, font, options: dict
     ax.set_prop_cycle(color=list(options["colors"]))
     if not rows:
         ax.text(0.5, 0.5, "No data", ha="center", va="center", fontproperties=font)
+    elif chart_type == "KPI":
+        _render_kpi(ax, response, font, options)
+    elif chart_type == "TABLE":
+        _render_table(ax, response, font, options)
     elif chart_type in {"BAR", "PIE", "LINE"}:
         _render_category(ax, chart_type, rows, font, options)
     elif chart_type == "SCATTER":
@@ -789,10 +877,11 @@ def _render_chart(ax, chart_type: str, response, title: str, font, options: dict
         _render_treemap(ax, rows, font, options)
     else:
         raise ValueError(f"unsupported artifact chart type: {chart_type}")
-    for line in response.reference_lines:
-        ax.axhline(line.value, color=line.color or "#d62728", linestyle="--", linewidth=1, label=line.label)
+    if chart_type not in {"KPI", "TABLE"}:
+        for line in response.reference_lines:
+            ax.axhline(line.value, color=line.color or "#d62728", linestyle="--", linewidth=1, label=line.label)
     ax.set_title(title, fontproperties=font, fontsize=11)
-    if chart_type not in {"PIE", "FUNNEL", "SANKEY", "TREEMAP"}:
+    if chart_type not in {"KPI", "TABLE", "PIE", "FUNNEL", "SANKEY", "TREEMAP"}:
         formatter = FuncFormatter(lambda value, _position: _format_number(value, options, axis=True))
         if chart_type == "SCATTER":
             ax.xaxis.set_major_formatter(formatter)
@@ -894,6 +983,7 @@ def _render_artifact(
     compiled = _compiled_queries(request)
     rendered: list[dict] = []
     source_versions: dict[str, str] = {}
+    query_render_warnings: list[str] = []
     for item in compiled:
         _check_cancelled(
             data_root,
@@ -902,8 +992,25 @@ def _render_artifact(
             check_tombstone=check_tombstone,
         )
         response = run_analytics_query(item["query"], data_root)
+        chart_id = item["chartId"]
+        if source_versions and response.source_version not in source_versions.values():
+            first_chart_id, first_source_version = next(iter(source_versions.items()))
+            raise RuntimeError(
+                "analysis artifact source changed between charts; mixed sourceVersion "
+                "values are not allowed: "
+                f"{first_chart_id}={first_source_version}, "
+                f"{chart_id}={response.source_version}; retry"
+            )
         rendered.append({**item, "response": response})
-        source_versions[item["chartId"]] = response.source_version
+        source_versions[chart_id] = response.source_version
+        query_render_warnings.extend(
+            f"[{chart_id}] {warning}" for warning in response.warnings
+        )
+        if response.truncated:
+            query_render_warnings.append(
+                f"[{chart_id}] Query result was truncated; "
+                "the artifact contains only the returned rows."
+            )
     _check_cancelled(
         data_root,
         request,
@@ -912,7 +1019,8 @@ def _render_artifact(
     )
 
     title = str(request.spec.get("title") or request.name)
-    figure, font_name, render_warnings = _build_figure(title, rendered)
+    figure, font_name, figure_render_warnings = _build_figure(title, rendered)
+    render_warnings = [*query_render_warnings, *figure_render_warnings]
     file_name = _safe_file_name(request.name, request.format)
     output = staging_root / "files" / file_name
     output.parent.mkdir(parents=True, exist_ok=True)

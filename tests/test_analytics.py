@@ -150,10 +150,18 @@ class AnalyticsQueryTest(unittest.TestCase):
             self.assertTrue(response.rows)
             self.assertTrue(all(row["value"] is not None for row in response.rows))
 
-    def test_eight_chart_happy_paths_use_actual_parquet(self):
+    def test_ten_chart_happy_paths_use_actual_parquet(self):
         with tempfile.TemporaryDirectory() as data_root:
             create_source(data_root)
             cases = {
+                "KPI": {
+                    "value": {"column": "value", "aggregation": "SUM"},
+                },
+                "TABLE": {
+                    "category": {"column": "category"},
+                    "value": {"column": "value", "aggregation": "SUM"},
+                    "series": {"column": "series"},
+                },
                 "BAR": {
                     "category": {"column": "category"},
                     "value": {"column": "value", "aggregation": "SUM"},
@@ -196,6 +204,8 @@ class AnalyticsQueryTest(unittest.TestCase):
                 },
             }
             expected_keys = {
+                "KPI": {"value"},
+                "TABLE": {"category", "value", "series"},
                 "BAR": {"category", "value"},
                 "PIE": {"category", "value"},
                 "LINE": {"category", "value", "series"},
@@ -215,6 +225,10 @@ class AnalyticsQueryTest(unittest.TestCase):
                     self.assertEqual(expected_keys[chart_type], set(response.rows[0]))
                     self.assertTrue(response.source_version.startswith("sha256:"))
 
+            kpi = run(data_root, request_payload("KPI", cases["KPI"]))
+            self.assertEqual([{"value": 123}], kpi.rows)
+            self.assertFalse(kpi.truncated)
+
             box = run(data_root, request_payload("BOXPLOT", cases["BOXPLOT"]))
             group_one = next(row for row in box.rows if row["category"] == "G1")
             self.assertEqual(5, group_one["count"])
@@ -233,6 +247,59 @@ class AnalyticsQueryTest(unittest.TestCase):
             )
             precise_group_one = next(row for row in precise_box.rows if row["category"] == "G1")
             self.assertEqual(1, precise_group_one["outlierCount"])
+
+    def test_kpi_contract_and_table_category_semantics(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+
+            filtered_kpi = run(
+                data_root,
+                request_payload(
+                    "KPI",
+                    {"value": {"aggregation": "COUNT"}},
+                    filters=[{"column": "active", "operator": "EQ", "value": True}],
+                ),
+            )
+            self.assertEqual([{"value": 5}], filtered_kpi.rows)
+
+            invalid_kpis = [
+                request_payload("KPI", {}),
+                request_payload("KPI", {"value": {"column": "value"}}),
+                request_payload(
+                    "KPI",
+                    {
+                        "category": {"column": "category"},
+                        "value": {"column": "value", "aggregation": "SUM"},
+                    },
+                ),
+            ]
+            for payload in invalid_kpis:
+                with self.subTest(payload=payload):
+                    with self.assertRaises(ValueError):
+                        run(data_root, payload)
+
+            table_payload = request_payload(
+                "TABLE",
+                {
+                    "category": {"column": "category"},
+                    "value": {"column": "value", "aggregation": "SUM"},
+                },
+                sorts=[{"field": "category", "direction": "ASC"}],
+            )
+            table = run(data_root, table_payload)
+            self.assertEqual(["A", "B", "C", "D"], [row["category"] for row in table.rows])
+            self.assertEqual([3, 7, 100, 6], [row["value"] for row in table.rows])
+
+            table_payload["topN"] = {
+                "enabled": True,
+                "count": 2,
+                "by": "value",
+                "direction": "DESC",
+                "includeOthers": False,
+            }
+            top_table = run(data_root, table_payload)
+            self.assertEqual(["C", "B"], [row["category"] for row in top_table.rows])
+            self.assertTrue(top_table.truncated)
 
     def test_upload_and_extract_artifacts_share_user_datst_contract(self):
         with tempfile.TemporaryDirectory() as data_root:
@@ -540,14 +607,18 @@ class AnalyticsQueryTest(unittest.TestCase):
             self.assertIs(AnalyticsQueryResponse, route.response_model)
 
             with patch.dict("os.environ", {"ANALYTICS_MAX_SOURCE_BYTES": "1"}):
-                sliced = run(
+                full_scan = run(
                     data_root,
                     request_payload(
-                        "BAR",
-                        {"category": {"column": "category"}, "value": {"aggregation": "COUNT"}},
+                        "KPI",
+                        {"value": {"aggregation": "COUNT"}},
                     ),
                 )
-                self.assertTrue(any("first" in warning and "rows were analyzed" in warning for warning in sliced.warnings))
+                self.assertEqual([{"value": 7}], full_scan.rows)
+                self.assertFalse(full_scan.truncated)
+                self.assertNotIn("sourceTruncated", full_scan.metadata)
+                self.assertNotIn("analyzedSourceRows", full_scan.metadata)
+                self.assertFalse(any("rows were analyzed" in warning for warning in full_scan.warnings))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from pydantic import ValidationError
 
 import app as api_app
+import cdw_extract.analytics as analytics_module
 import cdw_extract.analytics_artifacts as artifact_module
 from cdw_extract.analytics import run_analytics_detail, run_analytics_query
 from cdw_extract.analytics_artifacts import (
@@ -51,6 +52,12 @@ def calculated_field() -> dict:
 
 
 CHART_ENCODINGS = {
+    "KPI": {"value": {"column": "value", "aggregation": "SUM"}},
+    "TABLE": {
+        "category": {"column": "category"},
+        "value": {"column": "value", "aggregation": "SUM"},
+        "series": {"column": "series"},
+    },
     "BAR": {"category": {"column": "category"}, "value": {"column": "value", "aggregation": "SUM"}},
     "PIE": {"category": {"column": "category"}, "value": {"aggregation": "COUNT"}},
     "LINE": {"category": {"column": "event_date", "timeGrain": "MONTH"}, "value": {"aggregation": "COUNT"}},
@@ -413,8 +420,118 @@ class AnalyticsDslV2Test(unittest.TestCase):
             self.assertTrue(response.has_more)
             self.assertEqual([200, 14], [row["double_value"] for row in response.rows])
 
+    def test_query_and_detail_reject_a_source_version_change_during_execution(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+            query = AnalyticsQueryRequest.model_validate(
+                request_payload("BAR", CHART_ENCODINGS["BAR"])
+            )
+            initial = analytics_module._resolve_source(query, data_root)
+            changed = (initial[0], initial[1], "sha256:changed-during-query")
+            with patch.object(
+                analytics_module,
+                "_resolve_source",
+                side_effect=[initial, changed],
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "source changed during analysis; retry",
+                ):
+                    run_analytics_query(query, data_root)
+
+            detail = AnalyticsDetailRequest.model_validate(
+                {
+                    "schemaVersion": 1,
+                    "requestId": "detail-source-change",
+                    "source": query.source.model_dump(by_alias=True),
+                    "detailColumns": [{"column": "category"}],
+                    "limit": 2,
+                }
+            )
+            initial = analytics_module._resolve_source(detail, data_root)
+            changed = (initial[0], initial[1], "sha256:changed-during-detail")
+            with patch.object(
+                analytics_module,
+                "_resolve_source",
+                side_effect=[initial, changed],
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "source changed during analysis; retry",
+                ):
+                    run_analytics_detail(detail, data_root)
+
 
 class AnalyticsArtifactTest(unittest.TestCase):
+    def test_artifact_rejects_mixed_chart_source_versions(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+            payload = artifact_payload(
+                "PNG",
+                "artifact-mixed-source-versions",
+                all_charts=True,
+            )
+            payload["spec"]["queries"] = payload["spec"]["queries"][:2]
+            payload["spec"]["dashboard"]["charts"] = payload["spec"]["dashboard"]["charts"][:2]
+            request = AnalyticsArtifactRequest.model_validate(payload)
+            compiled = artifact_module._compiled_queries(request)
+            responses = [
+                run_analytics_query(item["query"], data_root) for item in compiled
+            ]
+            responses[1] = responses[1].model_copy(
+                update={"source_version": "sha256:different-source-version"}
+            )
+            prepare_analysis_artifact_job(request, data_root)
+
+            with patch.object(
+                artifact_module,
+                "run_analytics_query",
+                side_effect=responses,
+            ):
+                run_analysis_artifact_job(request, data_root)
+
+            job = load_job(data_root, request.job_id)
+            self.assertEqual("FAILED", job["state"])
+            self.assertEqual("RuntimeError", job["errorCode"])
+            self.assertIn("mixed sourceVersion values are not allowed", job["message"])
+            self.assertIn("chart-1=", job["message"])
+            self.assertIn("chart-2=", job["message"])
+            self.assertFalse(
+                artifact_root(
+                    data_root,
+                    USER_ID,
+                    request.analysis_artifact_id,
+                ).exists()
+            )
+
+    def test_artifact_manifest_includes_chart_query_warnings_and_truncation(self):
+        with tempfile.TemporaryDirectory() as data_root:
+            create_source(data_root)
+            payload = artifact_payload("PNG", "artifact-query-warnings")
+            payload["spec"]["queries"][0]["query"]["limit"] = 1
+            request = AnalyticsArtifactRequest.model_validate(payload)
+            prepare_analysis_artifact_job(request, data_root)
+            run_analysis_artifact_job(request, data_root)
+
+            _path, manifest = analysis_artifact_download(
+                data_root,
+                USER_ID,
+                request.analysis_artifact_id,
+            )
+            chart_warnings = [
+                warning
+                for warning in manifest["renderWarnings"]
+                if warning.startswith("[chart-1]")
+            ]
+            self.assertTrue(
+                any("Result exceeded the 1-row cap" in warning for warning in chart_warnings)
+            )
+            self.assertIn(
+                "[chart-1] Query result was truncated; "
+                "the artifact contains only the returned rows.",
+                chart_warnings,
+            )
+
     def test_legacy_runner_reuses_callback_free_render_operation(self):
         with tempfile.TemporaryDirectory() as data_root:
             create_source(data_root)
@@ -562,12 +679,20 @@ class AnalyticsArtifactTest(unittest.TestCase):
                     run_analysis_artifact_job(request, data_root)
                     path, manifest = analysis_artifact_download(data_root, USER_ID, analysis_artifact_id)
                     self.assertTrue(path.read_bytes().startswith(signature))
-                    self.assertEqual(8, manifest["chartCount"])
+                    self.assertEqual(10, manifest["chartCount"])
                     self.assertTrue(manifest["sha256Checksum"])
                     self.assertGreater(manifest["sizeBytes"], 100)
+                    self.assertFalse(
+                        any(
+                            "rendered as an error panel" in warning
+                            for warning in manifest["renderWarnings"]
+                        )
+                    )
                     if output_format == "XLSX":
                         workbook = load_workbook(path)
                         self.assertIn("Dashboard", workbook.sheetnames)
+                        self.assertIn("KPI", workbook.sheetnames)
+                        self.assertIn("TABLE", workbook.sheetnames)
                         self.assertGreaterEqual(len(workbook["Dashboard"]._images), 1)
 
     def test_idempotency_download_integrity_and_deleted_artifact_cannot_resurrect(self):

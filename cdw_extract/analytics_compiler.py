@@ -199,14 +199,12 @@ class AnalyticsCompiler:
         request: AnalyticsQueryRequest,
         parquet_path: str | Path,
         schema: list[tuple[str, str]],
-        source_row_limit: int | None = None,
     ):
         self.request = request
         self.parquet_path = Path(parquet_path).as_posix()
         self.schema = {
             name: ColumnInfo(name, duckdb_type) for name, duckdb_type in schema
         }
-        self.source_row_limit = source_row_limit
         if not self.schema:
             raise ValueError("source Parquet schema is empty")
         self.calculated_columns: dict[str, ColumnInfo] = {}
@@ -496,8 +494,6 @@ class AnalyticsCompiler:
 
     def _source_sql(self) -> str:
         relation = "read_parquet(?)"
-        if self.source_row_limit is not None:
-            relation = f"(SELECT * FROM read_parquet(?) LIMIT {self.source_row_limit})"
         base = f"{relation} AS {quote_ident('__raw')}"
         if not self._calculated_selects:
             return f"{relation} AS {quote_ident('__src')}"
@@ -513,14 +509,28 @@ class AnalyticsCompiler:
 
     def compile(self) -> CompiledAnalyticsQuery:
         chart_type = self.request.chart_type
+        if chart_type == ChartType.KPI:
+            self._validate_roles({"value"})
+            return self._compile_kpi()
         if (
             self.request.top_n
             and self.request.top_n.enabled
             and chart_type
-            not in {ChartType.BAR, ChartType.PIE, ChartType.LINE, ChartType.FUNNEL}
+            not in {
+                ChartType.TABLE,
+                ChartType.BAR,
+                ChartType.PIE,
+                ChartType.LINE,
+                ChartType.FUNNEL,
+            }
         ):
             raise ValueError("topN is supported only for category charts")
-        if chart_type in {ChartType.BAR, ChartType.PIE, ChartType.LINE}:
+        if chart_type in {
+            ChartType.TABLE,
+            ChartType.BAR,
+            ChartType.PIE,
+            ChartType.LINE,
+        }:
             self._validate_roles({"category", "value", "series"})
             category = self._category_field()
             return self._compile_category_chart(category, chart_type)
@@ -548,6 +558,43 @@ class AnalyticsCompiler:
             self._validate_roles({"hierarchy", "value"})
             return self._compile_treemap()
         raise ValueError(f"unsupported chartType: {chart_type}")
+
+    def _compile_kpi(self) -> CompiledAnalyticsQuery:
+        value = self._required(self.request.encoding.value, "encoding.value")
+        if value.aggregation is None:
+            raise ValueError("KPI encoding.value requires an explicit aggregation")
+        if self.request.sorts:
+            raise ValueError("KPI does not support sorts")
+        if self.request.top_n and self.request.top_n.enabled:
+            raise ValueError("KPI does not support topN")
+        if self.request.drilldown is not None:
+            raise ValueError("KPI does not support drilldown")
+        if self.request.comparison and self.request.comparison.enabled:
+            raise ValueError("KPI does not support comparison")
+        if self._include_others():
+            raise ValueError("KPI does not support includeOthers")
+        if self.request.options.value_transform != ValueTransform.NONE:
+            raise ValueError("KPI does not support valueTransform")
+
+        value_expression, _aggregation = self._measure(value)
+        where, filter_parameters = self._where([])
+        sql = (
+            f"SELECT {value_expression} AS {quote_ident('value')} "
+            f"FROM {self._source_sql()}{where}"
+        )
+        return CompiledAnalyticsQuery(
+            sql=sql,
+            parameters=self._query_parameters(filter_parameters),
+            columns=[
+                AnalyticsColumn(
+                    key="value",
+                    label=self._field_label(value, "Value"),
+                    type="NUMBER",
+                )
+            ],
+            row_limit=1,
+            detect_truncation=False,
+        )
 
     def _category_field(self) -> AnalyticsField:
         if self.request.drilldown is not None:
@@ -976,8 +1023,15 @@ class AnalyticsCompiler:
         self,
         context: _CategoryChartContext,
     ) -> CompiledAnalyticsQuery:
-        if context.chart_type not in {ChartType.BAR, ChartType.PIE, ChartType.FUNNEL}:
-            raise ValueError("includeOthers is supported only for BAR, PIE, and FUNNEL")
+        if context.chart_type not in {
+            ChartType.TABLE,
+            ChartType.BAR,
+            ChartType.PIE,
+            ChartType.FUNNEL,
+        }:
+            raise ValueError(
+                "includeOthers is supported only for TABLE, BAR, PIE, and FUNNEL"
+            )
         if context.series:
             raise ValueError("includeOthers does not support encoding.series")
         if context.aggregation not in {Aggregation.COUNT, Aggregation.SUM}:
@@ -1444,9 +1498,8 @@ class AnalyticsDetailCompiler(AnalyticsCompiler):
         request: AnalyticsDetailRequest,
         parquet_path: str | Path,
         schema: list[tuple[str, str]],
-        source_row_limit: int | None = None,
     ):
-        super().__init__(request, parquet_path, schema, source_row_limit)  # type: ignore[arg-type]
+        super().__init__(request, parquet_path, schema)  # type: ignore[arg-type]
         self.request: AnalyticsDetailRequest = request
 
     def compile(self) -> CompiledDetailQuery:
