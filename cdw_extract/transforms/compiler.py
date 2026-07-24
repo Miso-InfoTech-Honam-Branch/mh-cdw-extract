@@ -25,6 +25,28 @@ MAX_OUTPUT_COLUMNS = 500
 MAX_PIVOT_VALUES = 100
 MAX_PIVOT_COLUMNS = 200
 
+_DUCKDB_CAST_TYPES = {
+    "STRING": "VARCHAR",
+    "BOOLEAN": "BOOLEAN",
+    "INT64": "BIGINT",
+    "DATE": "DATE",
+    "TIMESTAMP": "TIMESTAMP",
+    "TIMESTAMP_TZ": "TIMESTAMPTZ",
+    "BINARY": "BLOB",
+}
+
+
+def _duckdb_cast_type(data_type: str) -> str | None:
+    """Map a normalized logical scalar type to a closed, injection-safe SQL type."""
+
+    normalized = normalize_type(data_type)
+    if normalized == "NULL":
+        return None
+    if normalized.startswith("DECIMAL("):
+        # normalize_type has already validated and rebuilt precision and scale.
+        return normalized
+    return _DUCKDB_CAST_TYPES[normalized]
+
 
 @dataclass(frozen=True)
 class CompiledPipeline:
@@ -684,45 +706,191 @@ class PipelineCompiler:
             return quote_ident(column.physical_name), [column], column.data_type
         if op == "LITERAL":
             value = node.get("value")
+            data_type = normalize_type(
+                node.get("dataType") or ("NULL" if value is None else "STRING")
+            )
+            if data_type == "NULL" and value is not None:
+                raise ValueError("NULL literal type requires a null value")
             self.parameters.append(value)
-            return (
-                "?",
-                [],
-                normalize_type(
-                    node.get("dataType") or ("NULL" if value is None else "STRING")
-                ),
-            )
+            cast_type = _duckdb_cast_type(data_type)
+            expression = f"CAST(? AS {cast_type})" if cast_type else "?"
+            return expression, [], data_type
+        if op == "CASE":
+            return self._calc_case(node, depth)
         args = [self._calc(item, depth + 1) for item in node.get("args") or []]
-        sql = [item[0] for item in args]
-        sources = [col for item in args for col in item[1]]
-        if op in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"} and len(sql) == 2:
-            symbol = {"ADD": "+", "SUBTRACT": "-", "MULTIPLY": "*", "DIVIDE": "/"}[op]
-            typ, warning = numeric_result_type(args[0][2], args[1][2], op)
-            if warning:
-                self.warnings.append(
-                    {
-                        "code": warning,
-                        "message": "정수부를 보존하기 위해 소수 자릿수를 줄였습니다.",
-                    }
-                )
-            return f"({sql[0]} {symbol} {sql[1]})", sources, typ
-        if op == "COALESCE" and sql:
-            return (
-                f"COALESCE({', '.join(sql)})",
-                sources,
-                common_type([item[2] for item in args]),
+        strategy = {
+            "ADD": self._calc_arithmetic,
+            "SUBTRACT": self._calc_arithmetic,
+            "MULTIPLY": self._calc_arithmetic,
+            "DIVIDE": self._calc_arithmetic,
+            "COALESCE": self._calc_coalesce,
+            "CONCAT": self._calc_concat,
+            "EQ": self._calc_comparison,
+            "NE": self._calc_comparison,
+            "GT": self._calc_comparison,
+            "GTE": self._calc_comparison,
+            "LT": self._calc_comparison,
+            "LTE": self._calc_comparison,
+            "AND": self._calc_boolean,
+            "OR": self._calc_boolean,
+            "NOT": self._calc_boolean,
+            "DATE_DIFF": self._calc_date_diff,
+        }.get(op)
+        if strategy is None:
+            raise ValueError(f"unsupported calculation op: {op}")
+        return strategy(op, node, args)
+
+    @staticmethod
+    def _calc_parts(
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[list[str], list[ColumnSchema]]:
+        return (
+            [item[0] for item in args],
+            [column for item in args for column in item[1]],
+        )
+
+    def _calc_arithmetic(
+        self,
+        op: str,
+        _node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        if len(args) != 2:
+            raise ValueError(f"{op} requires exactly two arguments")
+        sql, sources = self._calc_parts(args)
+        symbol = {"ADD": "+", "SUBTRACT": "-", "MULTIPLY": "*", "DIVIDE": "/"}[op]
+        typ, warning = numeric_result_type(args[0][2], args[1][2], op)
+        if warning:
+            self.warnings.append(
+                {
+                    "code": warning,
+                    "message": "정수부를 보존하기 위해 소수 자릿수를 줄였습니다.",
+                }
             )
-        if op == "CONCAT" and sql:
-            return (
-                f"concat({', '.join('CAST(' + item + ' AS VARCHAR)' for item in sql)})",
-                sources,
-                "STRING",
-            )
-        raise ValueError(f"unsupported calculation op: {op}")
+        return f"({sql[0]} {symbol} {sql[1]})", sources, typ
+
+    def _calc_coalesce(
+        self,
+        _op: str,
+        _node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        if not args:
+            raise ValueError("COALESCE requires arguments")
+        sql, sources = self._calc_parts(args)
+        return (
+            f"COALESCE({', '.join(sql)})",
+            sources,
+            common_type([item[2] for item in args]),
+        )
+
+    def _calc_concat(
+        self,
+        _op: str,
+        _node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        if not args:
+            raise ValueError("CONCAT requires arguments")
+        sql, sources = self._calc_parts(args)
+        return (
+            f"concat({', '.join('CAST(' + item + ' AS VARCHAR)' for item in sql)})",
+            sources,
+            "STRING",
+        )
+
+    def _calc_comparison(
+        self,
+        op: str,
+        _node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        if len(args) != 2:
+            raise ValueError(f"{op} requires exactly two arguments")
+        common_type([item[2] for item in args])
+        sql, sources = self._calc_parts(args)
+        symbol = {
+            "EQ": "=",
+            "NE": "<>",
+            "GT": ">",
+            "GTE": ">=",
+            "LT": "<",
+            "LTE": "<=",
+        }[op]
+        return f"({sql[0]} {symbol} {sql[1]})", sources, "BOOLEAN"
+
+    def _calc_boolean(
+        self,
+        op: str,
+        _node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        expected = 1 if op == "NOT" else 2
+        if len(args) != expected:
+            raise ValueError(f"{op} requires exactly {expected} argument(s)")
+        if any(item[2] != "BOOLEAN" for item in args):
+            raise ValueError(f"{op} requires boolean arguments")
+        sql, sources = self._calc_parts(args)
+        expression = f"NOT {sql[0]}" if op == "NOT" else f"{sql[0]} {op} {sql[1]}"
+        return f"({expression})", sources, "BOOLEAN"
+
+    def _calc_date_diff(
+        self,
+        _op: str,
+        node: dict,
+        args: list[tuple[str, list[ColumnSchema], str]],
+    ) -> tuple[str, list[ColumnSchema], str]:
+        if len(args) != 2:
+            raise ValueError("DATE_DIFF requires exactly two arguments")
+        unit = str(node.get("unit") or "").upper()
+        if unit not in {"DAY", "MONTH", "YEAR"}:
+            raise ValueError("DATE_DIFF requires DAY, MONTH, or YEAR")
+        temporal = {"DATE", "TIMESTAMP", "TIMESTAMP_TZ"}
+        if any(item[2] not in temporal for item in args):
+            raise ValueError("DATE_DIFF requires temporal arguments")
+        sql, sources = self._calc_parts(args)
+        return (
+            f"date_diff('{unit.lower()}', {sql[0]}, {sql[1]})",
+            sources,
+            "INT64",
+        )
+
+    def _calc_case(
+        self, node: dict, depth: int
+    ) -> tuple[str, list[ColumnSchema], str]:
+        branches = node.get("branches") or []
+        else_node = node.get("else")
+        if not branches or else_node is None:
+            raise ValueError("CASE requires branches and else")
+        parts: list[str] = []
+        sources: list[ColumnSchema] = []
+        result_types: list[str] = []
+        for branch in branches:
+            when = self._calc(branch.get("when") or {}, depth + 1)
+            then = self._calc(branch.get("then") or {}, depth + 1)
+            if when[2] != "BOOLEAN":
+                raise ValueError("CASE when expressions must be boolean")
+            parts.append(f"WHEN {when[0]} THEN {then[0]}")
+            sources.extend(when[1])
+            sources.extend(then[1])
+            result_types.append(then[2])
+        otherwise = self._calc(else_node, depth + 1)
+        sources.extend(otherwise[1])
+        result_types.append(otherwise[2])
+        result_type = common_type(result_types)
+        return (
+            f"(CASE {' '.join(parts)} ELSE {otherwise[0]} END)",
+            sources,
+            result_type,
+        )
 
     def step_calculate(self, step_id: str, config: dict) -> None:
         expression, sources, inferred = self._calc(config.get("expression") or {})
         target = normalize_type(config.get("targetType") or inferred)
+        if config.get("targetType"):
+            cast_type = _duckdb_cast_type(target)
+            if cast_type:
+                expression = f"CAST({expression} AS {cast_type})"
         output = derived_column(
             step_id,
             config.get("outputId") or "calculated",
@@ -804,7 +972,16 @@ class PipelineCompiler:
             len(self.warnings),
         )
 
-    def _aggregate(self, item: dict, step_id: str) -> tuple[str, ColumnSchema]:
+    def _aggregate(
+        self,
+        item: dict,
+        step_id: str,
+        *,
+        over: str | None = None,
+        extra_sources: list[ColumnSchema] | None = None,
+        result_type: str | None = None,
+        cast_result: bool = False,
+    ) -> tuple[str, ColumnSchema]:
         op = str(item.get("op") or "").upper()
         source = self.column(item.get("columnId")) if item.get("columnId") else None
         if op == "COUNT_ROWS":
@@ -829,16 +1006,58 @@ class PipelineCompiler:
             sources = [source]
         else:
             raise ValueError(f"unsupported aggregate: {op}")
+        typ = normalize_type(result_type or typ)
+        if over is not None:
+            expr = f"{expr} OVER ({over})"
+        if cast_result:
+            cast_type = _duckdb_cast_type(typ)
+            if cast_type is None:  # pragma: no cover - aggregate types are never NULL
+                raise RuntimeError("aggregate result type cannot be NULL")
+            expr = f"CAST({expr} AS {cast_type})"
         output = derived_column(
             step_id,
             item.get("aggregateId") or op.lower(),
             item.get("label") or op,
             typ,
-            sources,
+            sources + (extra_sources or []),
             op,
             nullable=op not in {"COUNT", "COUNT_ROWS", "COUNT_DISTINCT"},
         )
         return f"{expr} AS {quote_ident(output.physical_name)}", output
+
+    def step_window_aggregate(self, step_id: str, config: dict) -> None:
+        aggregate = config.get("aggregate") or {}
+        op = str(aggregate.get("op") or "").upper()
+        source = (
+            self.column(aggregate.get("columnId"))
+            if aggregate.get("columnId")
+            else None
+        )
+        result_type = None
+        if op == "SUM" and source and normalize_type(source.data_type) == "INT64":
+            result_type = "DECIMAL(38,0)"
+        elif op in {"AVG", "MEDIAN"}:
+            result_type = "DECIMAL(38,6)"
+        partition_sources = [
+            self.column(column_id) for column_id in config.get("partitionBy") or []
+        ]
+        partition = ", ".join(
+            quote_ident(column.physical_name) for column in partition_sources
+        )
+        expression, output = self._aggregate(
+            aggregate,
+            step_id,
+            over=f"PARTITION BY {partition}" if partition else "",
+            extra_sources=partition_sources,
+            result_type=result_type,
+            cast_result=True,
+        )
+        self.output(
+            step_id,
+            self.passthrough() + [expression],
+            self.schema + [output],
+            len(self.warnings),
+        )
 
     def step_group_aggregate(self, step_id: str, config: dict) -> None:
         selects = []
